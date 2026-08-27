@@ -1,0 +1,44 @@
+# context-keyboard-display configuration.
+# Copied to ~/.claude/context-keyboard-display.yaml by --install; edit THAT file.
+
+# Where the keyboard lives. THE ONE KEY YOU MUST CHECK: the panel's IP on
+# your network. (This default is the address the old claude-code-keyboard-
+# status config used — presumably the same physical keyboard.)
+url: http://192.168.0.12/image/upload
+
+# Seconds between renders while the daemon runs.
+tick_seconds: 5.0
+# Re-push an identical frame this often (covers a rebooted/slept panel).
+heartbeat_seconds: 300.0
+# After a failed POST, back off (growing to 60 s).
+offline_backoff_seconds: 20.0
+http_timeout_seconds: 4.0
+jpeg_quality: 95
+
+# A transcript that moved within this many seconds counts as actively working.
+active_seconds: 45.0
+# Sessions quieter than this stop existing for the display entirely.
+session_ttl_seconds: 21600.0
+# The engagement window: a finished session keeps the between-turns screen
+# (instead of dropping to Idle) for this long after its last activity.
+engaged_seconds: 1800.0
+
+usage_poll_seconds: 60.0
+diff_poll_seconds: 5.0
+# How long the DONE toast pins a just-finished session's screen.
+toast_seconds: 4.0
+
+# Where the claude-code-keyboard-status checkout lives (imported as a library).
+upstream_path: ~/projects/claude-code-keyboard-status
+
+display:
+  # Per-project display names. The Sessions rows hold ~7 characters after the
+  # state dot; name each repo you actually work in once, and anything not in
+  # the map falls back to boundary-aware prefix truncation ("keyboard-display"
+  # -> "keybo…"). Aliases apply everywhere a project name renders.
+  aliases:
+    claude-code-keyboard-status: kbd-sts
+    context-keyboard-display: display
+    context-keyboard-display-planning: plan
+    # worldengine-api: we-api
+    # worldengine-web: we-web

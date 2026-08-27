@@ -1,0 +1,4 @@
+Pillow
+PyYAML
+# plus the sibling checkout, installed editable by --install:
+#   pip install -e ~/projects/claude-code-keyboard-status
