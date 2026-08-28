@@ -334,13 +334,20 @@ def claude_working(data, aliases):
 
 
 def claude_waiting(data, aliases):
-    """WAITING variant — the interrupt signal. Deliberately sparse: tool name
-    as a question ("Bash?"), stuck-for timer in WARN, project, clock."""
+    """WAITING variant — the interrupt signal. Deliberately sparse: stuck-for
+    timer in WARN, tool name as a question ("Bash?"), project, clock.
+
+    The timer takes the first content slot, not the tool name, so the time row
+    lands on the same baseline as WORKING's elapsed and BETWEEN-TURNS' duration.
+    Flipping between screens then reads as one field changing rather than the
+    whole layout shifting — and the eye already knows where to look for "how
+    long has this been sitting there", which is the urgent number here.
+    """
     c = Canvas()
     word, tint = STATE_STYLE["waiting"]
     y = header(c, "waiting", word, tint)
-    y = put(c, PAD, y, data["tool"], font(CORE_SIZE, 800), INK) + GAP_SECTION
     y = elapsed_row(c, y, data["stuck"], WARN) + GAP_SECTION
+    y = put(c, PAD, y, data["tool"], font(CORE_SIZE, 800), INK) + GAP_SECTION
     label = project_label(c.draw, data.get("project"), aliases,
                           font(FLOOR_SIZE, 700), INNER)
     y = put(c, PAD, y, label, font(FLOOR_SIZE, 700), DIM)

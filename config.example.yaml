@@ -6,7 +6,10 @@
 # status config used — presumably the same physical keyboard.)
 url: http://192.168.0.12/image/upload
 
-# Seconds between renders while the daemon runs.
+# Seconds between renders while the daemon runs. The two screens that animate
+# (Claude working / waiting) tick at 1 s regardless, so their stopwatch counts
+# in real seconds and the mascot spins smoothly; this is the rate for the
+# screens that hold still (idle, sessions, between-turns).
 tick_seconds: 5.0
 # Re-push an identical frame this often (covers a rebooted/slept panel).
 heartbeat_seconds: 300.0
@@ -22,6 +25,14 @@ session_ttl_seconds: 21600.0
 # The engagement window: a finished session keeps the between-turns screen
 # (instead of dropping to Idle) for this long after its last activity.
 engaged_seconds: 1800.0
+
+# How long a manual override lasts ("peek" semantics). `display.py mode
+# claude|sessions|idle` — and the hotkey's `mode next` — pin the panel to one
+# screen; this many seconds after it was set, the override is forgotten and the
+# panel falls back to `auto` on its own, so you never have to press your way
+# back. `auto` never expires (it is the resting state). Want the old sticky
+# behaviour? Set this to something huge, e.g. 86400.0.
+override_ttl_seconds: 60.0
 
 usage_poll_seconds: 60.0
 diff_poll_seconds: 5.0
@@ -42,3 +53,22 @@ display:
     context-keyboard-display-planning: plan
     # worldengine-api: we-api
     # worldengine-web: we-web
+
+keys:
+  # The global hotkeys (keys.py). Both must carry a real modifier: that is what
+  # lets macOS reserve them outright, with no Input Monitoring grant and no
+  # prompt. A bare letter would be registrable and catastrophic -- a reserved
+  # combination never reaches the app you are typing into, so binding "k" alone
+  # would stop the letter k working everywhere on the machine.
+  #
+  # binding         steps the screen cycle below -- and, while a session is
+  #                 drilled into, first steps back out to the switchboard.
+  # select_binding  drills into the switchboard and steps down its rows. Does
+  #                 nothing at all unless the switchboard is the screen showing.
+  binding: "ctrl+opt+cmd+k"
+  select_binding: "ctrl+opt+cmd+j"
+  cycle: [auto, claude, sessions, idle]
+  # auto: swallow only bindings that carry real modifiers (the tap engine's
+  # concern; a reserved Carbon hotkey is always swallowed either way).
+  swallow: auto
+  debounce_seconds: 0.35

@@ -185,14 +185,21 @@ def todo_view(facts):
     return {"count": "{}/{}".format(position, total), "item": item}
 
 
-def working_view(session, now, cfg, phase):
+def turn_started(session):
+    """When the turn on screen began — the hook's own timestamp, else the
+    state-file write, else the transcript's last activity. Shared with the
+    daemon, which needs the same number to decide how fast to tick."""
     hook = session.hook
     started = hook.get("turn_started_at")
     if not isinstance(started, (int, float)):
         started = hook.get("at") if isinstance(hook.get("at"), (int, float)) else session.last_activity
+    return started
+
+
+def working_view(session, now, cfg, phase):
     return {
         "phase": phase,
-        "elapsed": fmt_elapsed(now - started),
+        "elapsed": fmt_elapsed(now - turn_started(session)),
         "project": session.project,
         "todo": todo_view(session.facts),
         "diff": fmt_diff(diff_stat(session.cwd, now, cfg["diff_poll_seconds"])),
@@ -230,10 +237,22 @@ def between_view(session, now, cfg):
 _SESSION_ORDER = {"waiting": 0, "working": 1}
 
 
+def ordered_sessions(engaged):
+    """The switchboard's row order: waiting first, then working, then merely
+    engaged, each group by recency (engaged_sessions already delivers recency
+    order, and sorted() is stable, so the groups keep it).
+
+    Shared with the drill-down key so that "the next session" means the next
+    row down the list on the panel, rather than the next entry in some other
+    ordering the user cannot see.
+    """
+    return sorted(engaged, key=lambda s: _SESSION_ORDER.get(s.state, 2))
+
+
 def sessions_view(engaged, now):
     """Rows sort waiting-first, then working, then engaged-idle, each group
     by recency (engaged_sessions already delivers recency order)."""
-    entries = sorted(engaged, key=lambda s: _SESSION_ORDER.get(s.state, 2))
+    entries = ordered_sessions(engaged)
     return {
         "entries": [(s.state if s.state in ("waiting", "working") else "engaged",
                      s.project or "--") for s in entries],
