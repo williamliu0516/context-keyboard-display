@@ -48,23 +48,55 @@ redundant with the terminal status bar (model name, branch).
 
 [claude-code-keyboard-status]: https://github.com/williamliu0516/claude-code-keyboard-status
 
-## Install / run
+## Install
 
-```bash
-# prerequisite: the old repo's hooks are registered (once):
+```sh
+curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | sh
+```
+
+It asks for one thing — your panel's IP address — and configures everything
+else. Pass it in instead if you would rather not be asked:
+
+```sh
+curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | PANEL_IP=192.168.1.50 sh
+```
+
+The installer downloads this display **and** the `claude-code-keyboard-status`
+library it reads session state through into
+`~/.claude/context-keyboard-display/`, registers that library's five session
+hooks (preserving every other setting and every other tool's hooks in
+`settings.json`), builds a private virtualenv, and loads the launchd agents.
+Re-running it is how you upgrade; a re-run keeps the address you already
+configured unless you pass `PANEL_IP` again.
+
+**There is no default address.** It is whatever DHCP handed your keyboard, and
+a wrong guess fails as silence — frames POSTed into the void, a blank panel,
+nothing in the log explaining why. So the daemon refuses to push until `url` is
+set, and says so in as many words. Find the address on the panel's own display
+or settings app, or look for a new device in your router's client list.
+
+| Variable | Effect |
+| --- | --- |
+| `PANEL_IP` | the panel's address; asked for interactively when unset |
+| `CKD_SOURCE` / `CKS_SOURCE` | install from a fork or a `file://` path |
+| `INSTALL_DIR` | where the files land (default `~/.claude/context-keyboard-display`) |
+| `DRY_RUN=1` | fetch and verify everything, then stop before installing |
+
+### From a clone instead
+
+```sh
+# prerequisite: the library's hooks are registered (once):
 #   python3 ~/projects/claude-code-keyboard-status/keyboard_status.py --install
 
 python3 display.py --install     # venv, deps, config, launchd agent
                                  # (boots out the old daemon's agent)
 ```
 
-Config lands at `~/.claude/context-keyboard-display.yaml`. **The one key to
-check before it will reach the real device: `url`** — the keyboard's
-`/image/upload` endpoint (seeded with the same address the old repo's
-config used). Then set your `display.aliases` map: each repo you work in,
-named in ≤7 characters, because that's what a Sessions row holds.
+Config lands at `~/.claude/context-keyboard-display.yaml`. Set `url` to your
+panel, then set your `display.aliases` map: each repo you work in, named in ≤7
+characters, because that's what a Sessions row holds.
 
-Everyday commands:
+### Everyday commands
 
 ```bash
 python3 display.py --daemon --dry-run   # render loop -> out/frame.jpg, no POST
@@ -105,6 +137,64 @@ The daemon reads this at startup, so restart it after editing:
 advances from `auto`, starting the cycle over) and steps it one place through
 the same `keys.cycle` list the hotkey uses — `auto -> claude -> sessions ->
 idle -> auto` by default.
+
+## Which session am I looking at
+
+The three detail screens end in a coloured dot and six characters. That mark is
+derived from the session's `session_id`, and
+[claude-status-bar](https://github.com/williamliu0516/claude-status-bar) prints
+the identical mark in the terminal that session is running in. Glance at the
+panel, glance at the status line, and the pair either matches or it does not.
+
+This matters because the panel's other identifying field — the project name —
+does not identify anything when several sessions are open in one repository,
+which is the normal case. `cwd` is the same, the branch is the same, the model
+is the same. The session id is the only thing that differs, and on its own it
+is a 36-character UUID nobody can eyeball.
+
+The two projects share no code. This specification is the entire contract, and
+it is reproduced verbatim in both READMEs:
+
+```
+SESSION IDENTIFIER SPEC v1
+
+  tag   = session_id[:6], lowercased          (a UUID, so these are hex)
+  slot  = sha1(session_id utf-8).digest()[0] % 8
+  xterm = PALETTE[slot]
+  rgb   = the xterm-256 colour cube entry for that index:
+            i = xterm - 16;  r = i // 36;  g = (i // 6) % 6;  b = i % 6
+            rgb = (CUBE[r], CUBE[g], CUBE[b])
+
+  PALETTE = (45, 46, 49, 69, 201, 202, 211, 228)
+  CUBE    = (0, 95, 135, 175, 215, 255)
+
+  Terminal renders ESC[38;5;{xterm}m ● ; a full-colour display fills a dot
+  with rgb. Both therefore show one colour, not two similar ones.
+```
+
+Integer arithmetic only, deliberately — no float, no locale, no font or
+terminal metrics — so two independent implementations cannot drift.
+
+**Why eight slots and not sixteen.** `screens.py` already records that WARN and
+CLAY "are too close in hue to tell apart" at a 12 px dot; that pair measures
+ΔE 37.3 in CIE-Lab, which makes it this panel's own empirical floor for
+"distinguishable". A sixteen-slot palette selected from the colour cube gets
+its two nearest members down to ΔE 30.5 — below that floor. Eight slots hold
+ΔE 61.5, 1.65× the floor, and stay ΔE 34.1 clear of every semantic colour.
+Eight also divides 256, so `digest[0] % 8` is exactly uniform where `% 10` or
+`% 12` would over-weight the low slots. The identifier dot is drawn at radius 7
+rather than the switchboard's 6, since it carries eight colours where those
+rows carry three.
+
+**Colours do repeat.** With eight slots, three concurrent sessions collide
+about 34% of the time. That is the deliberate trade: a repeat is *visibly
+identical*, which reads as "check the tag", where a sixteen-slot near-miss
+would read as "these are different" when they are not. The tag is the
+authority; the colour is the fast path to it.
+
+**A session with no id shows no row.** `ident_view` returns None and the
+screens omit it, rather than drawing a placeholder — a tag that matches nothing
+in any terminal is noise on a panel this small.
 
 ## Hotkeys: drive the panel from the keyboard
 
@@ -241,6 +331,30 @@ the exact steps: it grants the *interpreter*, not the script — System
 Settings -> Privacy & Security -> Input Monitoring -> "+", then Cmd+Shift+G
 to paste the path it gives you. Restart the listener after granting:
 `launchctl kickstart -k gui/$(id -u)/com.williamliu.context-keyboard-keys`.
+
+## Security notes
+
+**Frames carry your work, in the clear.** The working screen renders the current
+TODO item's own text, and the daemon POSTs the JPEG over plain HTTP because that
+is the protocol the panel speaks. Anyone on the same network can read those
+frames off the wire, and can POST their own image to the panel. Fine on a home
+network; think twice on café Wi-Fi or a shared office VLAN.
+
+**The hotkeys need no privacy grant — unless you rebind them.** The defaults use
+Carbon's `RegisterEventHotKey`, which *reserves* those two combinations with the
+WindowServer and can observe nothing else, so macOS grants them silently. A
+binding Carbon cannot express — `fn`, or a bare key with no modifier — falls back
+to a `CGEventTap`, which is handed every keystroke on the system and so needs
+Input Monitoring. Before granting that, note that **TCC records the interpreter,
+not the script**: Input Monitoring on `python3` lets *any* Python script that
+interpreter later runs read your keystrokes, not just this one. `keys.py
+--permission` prints which binary that would be. Keep a binding with a real
+modifier and the question never arises.
+
+**`keys.py --watch` prints every keycode you press.** It exists to answer "what
+does my keyboard actually send for that combination" while you pick a binding,
+it needs the same Input Monitoring grant, and **the daemon never runs it** —
+`--daemon` logs the bound combination by name and never any other key.
 
 ## Data sources (all real, no mocks in the loop)
 

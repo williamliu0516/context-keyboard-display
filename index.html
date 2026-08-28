@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>context-keyboard-display</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-width: 46rem; margin: 4rem auto; padding: 0 1.25rem; }
+  pre { padding: 1rem; border-radius: 8px; overflow-x: auto;
+        background: color-mix(in srgb, currentColor 8%, transparent); }
+  a { color: inherit; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; }
+  dt { font-weight: 700; }
+  dd { margin: 0; }
+  small { opacity: .7; }
+</style>
+<h1>context-keyboard-display</h1>
+<p>Your Claude Code sessions, on a mechanical keyboard's 142&times;428 image panel.
+   A daemon watches every live session, decides which one deserves the screen, and
+   pushes a frame.</p>
+<dl>
+  <dt>working</dt><dd>which session is grinding, how long this turn has taken,
+    its current TODO item, the diff so far</dd>
+  <dt>waiting</dt><dd>a session wants permission &mdash; which tool, and how long
+    it has been sitting there</dd>
+  <dt>sessions</dt><dd>the switchboard, when two or more want you at once</dd>
+  <dt>idle</dt><dd>a clock you can read across a room, plus your 5-hour and weekly
+    usage</dd>
+</dl>
+<p>You will be asked for your panel's IP address; nothing else needs configuring.</p>
+<pre><code>curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | sh</code></pre>
+<p>Or skip the prompt:</p>
+<pre><code>curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | PANEL_IP=192.168.1.50 sh</code></pre>
+<p>Two hotkeys, and neither needs an accessibility or input-monitoring grant:
+   <code>Ctrl+Opt+Cmd+K</code> cycles the screens, <code>Ctrl+Opt+Cmd+J</code> walks
+   the session list.</p>
+<p><small>macOS. Installs alongside
+   <a href="https://github.com/williamliu0516/claude-code-keyboard-status">claude-code-keyboard-status</a>,
+   which owns the session hooks this reads.</small></p>
+<p><a href="https://github.com/williamliu0516/context-keyboard-display">Source and documentation
+   on GitHub</a></p>

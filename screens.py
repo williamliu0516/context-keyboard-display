@@ -277,10 +277,14 @@ def todo_block(canvas, y_ink, count, item, item_lines=2):
 
 
 def footer_clock(canvas, rule_y, text):
+    """Rule + centred clock. Returns the clock's ink bottom, so a row placed
+    after it (the identifier) can sit a known gap below rather than guessing."""
     rule(canvas, rule_y)
     clock_font = font(CLOCK_SIZE, 600, rounded=False)
-    write(canvas.draw, WIDTH / 2, rule_y + 11 - cap_box(canvas.draw, clock_font)[0],
+    top, cap = cap_box(canvas.draw, clock_font)
+    write(canvas.draw, WIDTH / 2, rule_y + 11 - top,
           text, clock_font, DIM, align="center")
+    return rule_y + 11 + cap
 
 
 def diff_row(canvas, y, adds, dels):
@@ -288,6 +292,29 @@ def diff_row(canvas, y, adds, dels):
     fonts = font(FLOOR_SIZE, 700)
     put(canvas, PAD, y, adds, fonts, GOOD)
     return put(canvas, WIDTH - PAD, y, dels, fonts, BAD, align="right")
+
+
+# The identifier dot is drawn a shade larger than the switchboard's state dots.
+# Those carry three well-separated colours; this one carries eight, and the
+# extra radius is what keeps the palette's nearest pair apart at a glance. See
+# collect.py's SESSION IDENTIFIER SPEC v1 for how the colour is derived.
+IDENT_DOT_R = 7
+
+
+def ident_row(canvas, y_ink, ident):
+    """Colour dot + six-character tag: the same pair the terminal's status bar
+    prints for this session. Returns the row's ink bottom, or `y_ink` unchanged
+    when the session has no id to identify."""
+    if not ident:
+        return y_ink
+    fonts = font(FLOOR_SIZE, 700)
+    cap = cap_box(canvas.draw, fonts)[1]
+    cx = PAD + IDENT_DOT_R
+    disc(canvas.vector, cx * SS, (y_ink + cap / 2) * SS, IDENT_DOT_R * SS,
+         tuple(ident["rgb"]) + (255,))
+    text_x = cx + IDENT_DOT_R + 7
+    return put(canvas, text_x, y_ink, ident["tag"], fonts, DIM,
+               budget=WIDTH - PAD - text_x)
 
 
 # ------------------------------------------------------------------ screens
@@ -323,13 +350,14 @@ def claude_working(data, aliases):
             bottom = diff_row(c, rule_y + 12, *diff)
         if not todo.get("item"):
             # Counter-only fallback: cutting the item line buys the clock back.
-            footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+            bottom = footer_clock(c, bottom + GAP_FOOTER, data["clock"])
     else:
         bottom = y - GAP_SECTION
         if diff:
             rule(c, y)
             bottom = diff_row(c, y + 12, *diff)
-        footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+        bottom = footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+    ident_row(c, bottom + GAP_FOOTER, data.get("ident"))
     return c.flatten()
 
 
@@ -351,7 +379,8 @@ def claude_waiting(data, aliases):
     label = project_label(c.draw, data.get("project"), aliases,
                           font(FLOOR_SIZE, 700), INNER)
     y = put(c, PAD, y, label, font(FLOOR_SIZE, 700), DIM)
-    footer_clock(c, y + GAP_FOOTER, data["clock"])
+    bottom = footer_clock(c, y + GAP_FOOTER, data["clock"])
+    ident_row(c, bottom + GAP_FOOTER, data.get("ident"))
     return c.flatten()
 
 
@@ -372,7 +401,8 @@ def claude_between_turns(data, aliases):
     if diff:
         rule(c, y)
         bottom = diff_row(c, y + 12, *diff)
-    footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+    bottom = footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+    ident_row(c, bottom + GAP_FOOTER, data.get("ident"))
     return c.flatten()
 
 
@@ -473,20 +503,31 @@ MOCK_SESSIONS_6 = [
     ("engaged", "keyboard-display"),
 ]
 
+# Three different session ids, so the previews show three different slots of
+# the identifier palette rather than one colour repeated.
+MOCK_IDENTS = {
+    "a3f92c": {"tag": "a3f92c", "rgb": (255, 95, 0)},
+    "7b14de": {"tag": "7b14de", "rgb": (0, 215, 255)},
+    "c081fa": {"tag": "c081fa", "rgb": (255, 0, 255)},
+}
+
 MOCKS = [
     ("claude_working", {
         "phase": 0.85, "elapsed": "4:32", "project": "psi0-detector",
         "todo": {"count": "3/7", "item": "wire up previews"},
-        "diff": ("+212", "−38"), "clock": "12:27"}),
+        "diff": ("+212", "−38"), "clock": "12:27",
+        "ident": MOCK_IDENTS["a3f92c"]}),
     ("claude_working_no_todos", {
         "phase": 0.85, "elapsed": "4:32", "project": "psi0-detector",
-        "todo": None, "diff": ("+212", "−38"), "clock": "12:27"}),
+        "todo": None, "diff": ("+212", "−38"), "clock": "12:27",
+        "ident": MOCK_IDENTS["a3f92c"]}),
     ("claude_waiting", {
         "tool": "Bash?", "stuck": "2:41", "project": "psi0-detector",
-        "clock": "12:27"}),
+        "clock": "12:27", "ident": MOCK_IDENTS["7b14de"]}),
     ("claude_between_turns", {
         "duration": "2m 14s", "project": "psi0-detector",
-        "diff": ("+212", "−38"), "clock": "12:27"}),
+        "diff": ("+212", "−38"), "clock": "12:27",
+        "ident": MOCK_IDENTS["c081fa"]}),
     ("sessions", {"entries": MOCK_SESSIONS_6, "clock": "12:27"}),
     ("sessions_overflow", {
         "entries": MOCK_SESSIONS_6 + [("engaged", "infra-tools"),

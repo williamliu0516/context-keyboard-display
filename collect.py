@@ -7,6 +7,7 @@ collect() discards: one SessionInfo per live session, plus the formatting
 that turns raw facts into the strings the screens draw.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -204,6 +205,7 @@ def working_view(session, now, cfg, phase):
         "todo": todo_view(session.facts),
         "diff": fmt_diff(diff_stat(session.cwd, now, cfg["diff_poll_seconds"])),
         "clock": clock_text(now),
+        "ident": ident_view(session),
     }
 
 
@@ -221,6 +223,7 @@ def waiting_view(session, now, cfg):
         "stuck": fmt_elapsed(now - since),
         "project": session.project,
         "clock": clock_text(now),
+        "ident": ident_view(session),
     }
 
 
@@ -231,7 +234,69 @@ def between_view(session, now, cfg):
         "project": session.project,
         "diff": fmt_diff(diff_stat(session.cwd, now, cfg["diff_poll_seconds"])),
         "clock": clock_text(now),
+        "ident": ident_view(session),
     }
+
+
+# --------------------------------------------------------------- identity
+#
+# SESSION IDENTIFIER SPEC v1 -- implemented identically here and in
+# claude-status-bar/statusline.py, which renders the same tag and colour in the
+# terminal that started the session. The two repositories share no code, so the
+# specification below is the entire contract; it is reproduced verbatim in both
+# READMEs. Integer arithmetic only, deliberately: no float, no locale, no font
+# metrics, so two independent implementations cannot drift.
+#
+#   tag   = session_id[:6], lowercased          (a UUID, so these are hex)
+#   slot  = sha1(session_id utf-8).digest()[0] % 8
+#   xterm = IDENT_PALETTE[slot]
+#   rgb   = the xterm-256 colour cube entry for that index:
+#             i = xterm - 16;  r = i // 36;  g = (i // 6) % 6;  b = i % 6
+#             rgb = (IDENT_CUBE[r], IDENT_CUBE[g], IDENT_CUBE[b])
+#
+# Eight slots, not sixteen, and the reason is measured rather than assumed.
+# screens.py already records that WARN and CLAY "are too close in hue to tell
+# apart" at a 12 px dot; that pair is dE 37.3 in CIE-Lab. A sixteen-slot
+# palette gets its two nearest members down to dE 30.5 -- *below* the distance
+# this panel has already proven indistinguishable. Eight slots hold dE 61.5,
+# 1.65x that threshold, and stay dE 34.1 clear of every semantic colour.
+#
+# Eight also divides 256, so `digest[0] % 8` is exactly uniform where % 10 or
+# % 12 would over-weight the low slots.
+#
+# Fewer slots means colours do repeat across concurrent sessions. That is the
+# honest trade: a repeat is *visibly identical*, which reads as "check the
+# tag", where a sixteen-slot near-miss would read as "these are different"
+# when they are not. The tag is the authority; the colour is the fast path.
+IDENT_CUBE = (0, 95, 135, 175, 215, 255)
+IDENT_PALETTE = (45, 46, 49, 69, 201, 202, 211, 228)
+
+
+def ident_tag(sid):
+    """The six characters a human compares against the terminal."""
+    return sid[:6].lower() if isinstance(sid, str) and sid else None
+
+
+def ident_rgb(sid):
+    """The slot colour for a session id, as a panel-ready (r, g, b)."""
+    if not isinstance(sid, str) or not sid:
+        return None
+    slot = hashlib.sha1(sid.encode("utf-8")).digest()[0] % len(IDENT_PALETTE)
+    index = IDENT_PALETTE[slot] - 16
+    return (IDENT_CUBE[index // 36], IDENT_CUBE[(index // 6) % 6],
+            IDENT_CUBE[index % 6])
+
+
+def ident_view(session):
+    """`{tag, rgb}` for a session, or None when it has no usable id.
+
+    None is a real case -- the screens simply omit the row -- rather than a
+    placeholder, because a tag nobody can match against anything is noise.
+    """
+    tag = ident_tag(getattr(session, "sid", None))
+    if not tag:
+        return None
+    return {"tag": tag, "rgb": ident_rgb(session.sid)}
 
 
 _SESSION_ORDER = {"waiting": 0, "working": 1}

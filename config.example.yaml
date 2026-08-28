@@ -1,10 +1,12 @@
 # context-keyboard-display configuration.
 # Copied to ~/.claude/context-keyboard-display.yaml by --install; edit THAT file.
 
-# Where the keyboard lives. THE ONE KEY YOU MUST CHECK: the panel's IP on
-# your network. (This default is the address the old claude-code-keyboard-
-# status config used — presumably the same physical keyboard.)
-url: http://192.168.0.12/image/upload
+# Where the keyboard lives. THE ONE KEY YOU MUST SET: the panel's own address
+# on your network. There is no useful default — it is whatever DHCP handed your
+# keyboard — so the daemon refuses to push frames until you replace this.
+# Find it on the keyboard's own display or settings app, or look for a new
+# device in your router's client list.
+url: http://PANEL-IP-NOT-SET/image/upload
 
 # Seconds between renders while the daemon runs. The two screens that animate
 # (Claude working / waiting) tick at 1 s regardless, so their stopwatch counts

@@ -52,8 +52,15 @@ OLD_CONFIG_PATH = os.path.join(CLAUDE_DIR, "keyboard-status.json")
 # engaged, so the cycle never strands the panel on an unreachable screen.
 MODES = ("auto", "claude", "sessions", "idle")
 
+# The panel's address has no sensible default: it is whatever DHCP handed your
+# keyboard on your network, and a wrong guess fails as a silent no-op (frames
+# POSTed into the void, an empty screen, nothing in the log that says why). So
+# ship a placeholder that cannot be mistaken for an address and refuse to push
+# until it is replaced -- see require_url.
+URL_UNSET = "http://PANEL-IP-NOT-SET/image/upload"
+
 DEFAULTS = {
-    "url": "http://192.168.0.12/image/upload",
+    "url": URL_UNSET,
     "width": 142,
     "height": 428,
     "tick_seconds": 5.0,
@@ -206,6 +213,29 @@ def reachability(cfg):
     except OSError as error:
         reason = error.strerror or type(error).__name__
         return "%s:%d unreachable (errno %s: %s)" % (host, port, error.errno, reason)
+
+
+def require_url(cfg):
+    """Stop, loudly, before pushing frames at a placeholder.
+
+    Returns an exit code when the address is unset and None when it is fine, so
+    callers can `return code` without a second branch.
+    """
+    if URL_UNSET not in cfg["url"]:
+        return None
+    sys.stderr.write(
+        "The keyboard's address is not set yet.\n"
+        "\n"
+        "Edit %s and set `url` to your panel's own address:\n"
+        "\n"
+        "    url: http://192.168.1.50/image/upload\n"
+        "\n"
+        "Find it on the keyboard's own display or settings app, or look for a\n"
+        "new device in your router's client list. Then restart the daemon:\n"
+        "\n"
+        "    launchctl kickstart -k gui/%d/%s\n"
+        % (CONFIG_PATH, os.getuid(), LAUNCH_LABEL))
+    return 2
 
 
 def push_frame(ks, frame, cfg):
@@ -899,6 +929,10 @@ def main(argv):
     if command == "--uninstall":
         uninstall()
         return 0
+    if command in ("--daemon", "--once") and not dry_run:
+        code = require_url(cfg)
+        if code is not None:
+            return code
     if command == "--daemon":
         log("starting: %s every %gs, %gs while working/waiting%s"
             % (cfg["url"], cfg["tick_seconds"],
