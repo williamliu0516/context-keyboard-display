@@ -15,22 +15,22 @@
 # upgrade, and a re-run keeps the address you already configured.
 #
 #   PANEL_IP           the keyboard's address. Asked for interactively if unset.
-#   CKD_SOURCE         override the display mirrors (a fork, a file:// path)
-#   CKS_SOURCE         override the library mirrors
+#   CKD_SOURCE         where to fetch the display from. Default: this repo on
+#                      raw.githubusercontent.com. Set it to a fork or a file://
+#                      path; whitespace-separated for several, tried in order.
+#   CKS_SOURCE         same, for the claude-code-keyboard-status library
 #   DRY_RUN=1          fetch and verify everything, then stop before installing
 #   INSTALL_DIR        where the files land (default ~/.claude/context-keyboard-display)
 set -eu
 
 CKD_BASES="${CKD_SOURCE:-}"
 if [ -z "$CKD_BASES" ]; then
-	CKD_BASES="https://xiaweiliu.com/keyboard-display
-https://raw.githubusercontent.com/williamliu0516/context-keyboard-display/main"
+	CKD_BASES="https://raw.githubusercontent.com/williamliu0516/context-keyboard-display/main"
 fi
 
 CKS_BASES="${CKS_SOURCE:-}"
 if [ -z "$CKS_BASES" ]; then
-	CKS_BASES="https://xiaweiliu.com/claude-code-keyboard-status
-https://raw.githubusercontent.com/williamliu0516/claude-code-keyboard-status/main"
+	CKS_BASES="https://raw.githubusercontent.com/williamliu0516/claude-code-keyboard-status/main"
 fi
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.claude/context-keyboard-display}"
@@ -57,8 +57,9 @@ Darwin) ;;
 *) fail "this display drives a macOS launchd agent and Claude Code's macOS hooks." ;;
 esac
 
-# Mirror failures are expected -- we fall through to the next one -- so their
-# diagnostics are suppressed. Only the final "no mirror worked" message is shown.
+# A source can fail -- with CKD_SOURCE / CKS_SOURCE naming several, we fall
+# through to the next -- so their diagnostics are suppressed. Only the final
+# "nothing worked" message is shown.
 if command -v curl >/dev/null 2>&1; then
 	fetch() { curl -fsSL "$1" -o "$2" 2>/dev/null; }
 elif command -v wget >/dev/null 2>&1; then
