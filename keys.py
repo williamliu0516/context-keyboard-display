@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Global hotkey listener: cycle the panel's screen mode from the keyboard.
 
+macOS only. Both engines below are macOS APIs, and there is no Linux port:
+an X11 grab is dead on a headless box and wrong under Wayland, and reading
+/dev/input is a keylogger that wants the input group. So off macOS every
+command here says so and does nothing -- `--install`/`--uninstall` succeed as
+no-ops, so a Linux install never fails on the hotkey it was never going to
+have, and everything else exits 3.
+
 One press of the bound key advances ~/.claude/context-keyboard-display-control.json
 through auto -> claude -> sessions -> idle -> auto; the display daemon reads
 that file on its next tick (<=5 s) and obeys it. No keyboard firmware macro is
@@ -38,6 +45,7 @@ import sys
 import time
 
 import display
+import service
 
 REPO_DIR = display.REPO_DIR
 LOG_PATH = os.path.join(display.CLAUDE_DIR, "context-keyboard-keys.log")
@@ -850,6 +858,9 @@ def write_plist(python):
 
 
 def install_agent(python):
+    if not service.hotkeys_supported():
+        print(UNSUPPORTED)
+        return
     write_plist(python)
     domain = "gui/%d" % os.getuid()
     display.launchctl("bootout", "%s/%s" % (domain, LAUNCH_LABEL))
@@ -861,6 +872,9 @@ def install_agent(python):
 
 
 def uninstall_agent():
+    if not service.hotkeys_supported():
+        print(UNSUPPORTED)
+        return
     domain = "gui/%d" % os.getuid()
     display.launchctl("bootout", "%s/%s" % (domain, LAUNCH_LABEL))
     display.launchctl("unload", LAUNCH_PLIST)
@@ -874,6 +888,19 @@ def uninstall_agent():
 # -------------------------------------------------------------------- entry
 
 USAGE = [p for p in __doc__.split("\n\n") if "python3 keys.py" in p][0] + "\n"
+
+UNSUPPORTED = (
+    "global hotkeys are macOS-only; this is %s.\n"
+    "\n"
+    "Nothing is installed and nothing is broken -- the display daemon does not\n"
+    "need this listener. The same step the hotkey takes is one command:\n"
+    "\n"
+    "    python3 display.py mode next        # auto -> claude -> sessions -> idle\n"
+    "    python3 display.py mode sessions    # or jump straight to one\n"
+    "\n"
+    "Bind that to whatever your desktop, shell or keyboard firmware already\n"
+    "uses for shortcuts."
+    % (service.system_name() or "an unknown platform"))
 
 
 def reexec_in_venv():
@@ -894,6 +921,15 @@ def reexec_in_venv():
 def main(argv):
     args = argv[1:]
     command = args[0] if args else "--help"
+    if command in ("--help", "-h"):
+        sys.stdout.write(USAGE)
+        return 0
+    if not service.hotkeys_supported():
+        print(UNSUPPORTED)
+        # --install/--uninstall are the two the installer runs, so they are the
+        # two that must not fail; the rest are a person asking for an engine
+        # that is not here, which is an error worth an exit code.
+        return 0 if command in ("--install", "--uninstall") else 3
     if command in ("--daemon", "--watch", "--simulate", "--permission",
                    "--selftest"):
         reexec_in_venv()

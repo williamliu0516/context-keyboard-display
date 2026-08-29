@@ -54,6 +54,12 @@ redundant with the terminal status bar (model name, branch).
 curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | sh
 ```
 
+One script, two hosts. On **macOS** it installs a launchd agent for the display
+and a second one for the `keys.py` global hotkey listener. On **Ubuntu/Debian**
+it installs a `systemd --user` service for the display and no hotkey listener —
+see [Ubuntu / Debian, headless](#ubuntu--debian-headless) below, which is the
+whole of the difference. Anything else is refused rather than half-supported.
+
 It asks for one thing — your panel's IP address — and configures everything
 else. Pass it in instead if you would rather not be asked:
 
@@ -81,6 +87,7 @@ or settings app, or look for a new device in your router's client list.
 | `CKD_SOURCE` / `CKS_SOURCE` | install from a fork or a `file://` path |
 | `INSTALL_DIR` | where the files land (default `~/.claude/context-keyboard-display`) |
 | `DRY_RUN=1` | fetch and verify everything, then stop before installing |
+| `CKD_PLATFORM` | override the detected OS (`Darwin` / `Linux`); a test hook, honoured by `display.py` and `service.py` too |
 
 ### From a clone instead
 
@@ -88,9 +95,14 @@ or settings app, or look for a new device in your router's client list.
 # prerequisite: the library's hooks are registered (once):
 #   python3 ~/projects/claude-code-keyboard-status/keyboard_status.py --install
 
-python3 display.py --install     # venv, deps, config, launchd agent
-                                 # (boots out the old daemon's agent)
+python3 display.py --install     # venv, deps, config, and the service:
+                                 #   macOS  launchd agent + keys.py hotkeys
+                                 #          (boots out the old daemon's agent)
+                                 #   Linux  systemd --user service, no hotkeys
 ```
+
+`python3 service.py --platform` prints which of those this host resolved to,
+before you install anything.
 
 Config lands at `~/.claude/context-keyboard-display.yaml`. Set `url` to your
 panel, then set your `display.aliases` map: each repo you work in, named in ≤7
@@ -137,6 +149,140 @@ The daemon reads this at startup, so restart it after editing:
 advances from `auto`, starting the cycle over) and steps it one place through
 the same `keys.cycle` list the hotkey uses — `auto -> claude -> sessions ->
 idle -> auto` by default.
+
+## Ubuntu / Debian, headless
+
+The daemon itself was always portable — it reads Claude Code's own files and
+POSTs a JPEG. What was macOS-only was everything *around* it: a launchd agent,
+a Carbon hotkey listener, and the San Francisco fonts the renderer names by
+absolute path. On Linux those become a `systemd --user` service, no hotkey
+listener at all, and whichever system face is installed.
+
+### Prerequisites
+
+| Need | Why | Check |
+| --- | --- | --- |
+| Python **3.9+** | same floor as macOS | `python3 -V` |
+| `python3-venv` | the install builds a private venv, and Debian ships `venv` without `ensurepip` | `python3 -c 'import venv, ensurepip'` |
+| a system font | the renderer's macOS faces do not exist here | `python3 service.py --fonts` |
+| `curl` or `wget` | fetching the install | — |
+
+**`python3-venv` needs a package, and the installer will not install it for
+you** — it has no business running `apt` as root on your machine, and on a
+managed box it could not anyway. If the check above fails:
+
+```sh
+sudo apt install python3-venv        # or python3.12-venv, matching python3 -V
+```
+
+No sudo? Any of these works instead, and none of them needs root: ask an
+administrator for that one package, or put a self-contained Python first on
+`PATH` (`pyenv`, `uv python install`, conda) and re-run. The installer stops
+with this exact advice rather than failing halfway through a broken venv.
+
+**Fonts.** `fonts-noto-core` gives the closest match to the macOS look, and
+`fonts-noto-cjk` is what keeps a Chinese or Japanese TODO item from rendering
+as tofu. `fonts-dejavu-core` is present on most images already and is used as
+a fallback. Missing them is not fatal — the daemon warns once and falls back
+to Pillow's 11 px bitmap font, which is legible and ugly.
+
+```sh
+sudo apt install fonts-noto-core fonts-noto-cjk fonts-dejavu-core
+python3 service.py --fonts     # what the daemon will actually load
+```
+
+Nothing else about the install needs root. The unit is a **user** unit in
+`~/.config/systemd/user`, not `/etc/systemd/system`.
+
+### Install
+
+```sh
+curl -fsSL https://xiaweiliu.com/keyboard-display/install.sh | PANEL_IP=192.168.1.50 sh
+```
+
+Identical to the macOS command; the platform is detected. On a headless box
+pass `PANEL_IP` rather than relying on the prompt, which needs a terminal.
+What it does differently here:
+
+- installs `Pillow` and `PyYAML` only — no `pyobjc`, which is macOS-only and
+  has no Linux wheel;
+- writes `~/.config/systemd/user/context-keyboard-display.service`, then
+  `systemctl --user enable --now` it;
+- runs `loginctl enable-linger` so the service survives you logging out —
+  **the one step that makes "headless" true.** If polkit refuses (common over
+  ssh with no seat), the installer says so and prints
+  `sudo loginctl enable-linger $USER` for an admin. Without it the panel only
+  updates while you are logged in;
+- skips the hotkey listener, loudly, and does not fail over it;
+- still registers the `claude-code-keyboard-status` session hooks, which are
+  plain `settings.json` edits and entirely portable. That library's own
+  installer prints "loaded launchd agent" on any platform; on Linux nothing
+  was loaded and this installer says so, and deletes the inert plist it wrote.
+
+### Running it
+
+```sh
+systemctl --user status context-keyboard-display.service     # is it up
+journalctl --user -u context-keyboard-display.service -f     # unit-level: starts, exits, restarts
+tail -f ~/.claude/context-keyboard-display.log               # the daemon's own lines
+systemctl --user restart context-keyboard-display.service    # after editing the config
+systemctl --user stop context-keyboard-display.service       # pause without uninstalling
+```
+
+Both log destinations work because the unit sets
+`StandardOutput=append:~/.claude/context-keyboard-display.log`, so the same
+`tail -f` from the macOS docs is the same command here. `append:` needs
+systemd ≥ 240 (Ubuntu 20.04 ships 245); on anything older the generated unit
+omits the redirect and the journal is the only log. `python3 service.py
+--print-unit` shows exactly what will be written, before writing it.
+
+Everything under [Everyday commands](#everyday-commands) works unchanged —
+`--status`, `--once`, `--live`, `--preview`, `mode ...`. Uninstall:
+
+```sh
+python3 ~/.claude/context-keyboard-display/display.py --uninstall
+```
+
+which disables and stops the unit, removes it, and reloads systemd. It leaves
+your config and the venv alone, exactly as the macOS `--uninstall` does.
+
+### No global hotkeys, deliberately
+
+`Ctrl+Opt+Cmd+K` and `Ctrl+Opt+Cmd+J` do not exist on Linux and are not
+planned. `keys.py` is built on Carbon's `RegisterEventHotKey` and
+`CGEventTap`; the Linux equivalents are an X11 grab, which is meaningless on a
+headless box and wrong under Wayland, or reading `/dev/input`, which is a
+keylogger that wants your user in the `input` group. Neither is a fair trade
+for a convenience key.
+
+So `keys.py` is installed but inert here: every command prints why and does
+nothing. `--install` and `--uninstall` exit **0**, which is what keeps a Linux
+install from failing on a listener it was never going to have; everything else
+exits **3**.
+
+The panel is still fully drivable — the hotkey never did anything you cannot
+type:
+
+```sh
+python3 ~/.claude/context-keyboard-display/display.py mode next       # the K key
+python3 ~/.claude/context-keyboard-display/display.py mode sessions   # jump straight there
+```
+
+Both take effect in ~0.3 s, same as a keypress: the daemon watches the control
+file rather than the clock. Bind them to whatever your terminal multiplexer,
+desktop, or keyboard firmware already uses for shortcuts — that layer knows
+about your input devices and this daemon does not need to.
+
+### What is *not* claimed here
+
+This platform work was written and tested on macOS, driving the Linux branch
+through `CKD_PLATFORM=Linux`: the installer's dry runs, the generated unit,
+the routing between launchd and systemd, the font substitution, and a full
+sandboxed `install.sh` run. `tests/test_platform.py` and
+`tests/test_install_sh.sh` are that suite. **No part of it has been run
+against real Ubuntu hardware or a real panel on Linux** — `systemctl enable`,
+`loginctl enable-linger`, and the actual on-panel appearance of Noto in place
+of San Francisco are all unverified.
 
 ## Which session am I looking at
 

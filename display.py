@@ -20,6 +20,11 @@ here as a library.
                                           (an override lapses back to auto after
                                           override_ttl_seconds, default 60)
     python3 keys.py --permission          the hotkey that calls `mode next` for you
+
+macOS runs the daemon under launchd and installs the keys.py hotkey listener
+beside it; Ubuntu/Debian runs it under a systemd --user service and has no
+hotkey listener at all. service.py owns that split -- `python3 service.py
+--platform` reports what this host resolved to.
 """
 
 import json
@@ -28,6 +33,13 @@ import sys
 import time
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# Ahead of `import service`: this module is imported by keys.py and by the
+# tests, not only run as a script, so REPO_DIR is not always on the path yet.
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
+
+import service  # noqa: E402
+
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 CONFIG_PATH = os.path.join(CLAUDE_DIR, "context-keyboard-display.yaml")
 CONTROL_PATH = os.path.join(CLAUDE_DIR, "context-keyboard-display-control.json")
@@ -157,14 +169,42 @@ def load_config():
     return config
 
 
+def upstream_dir(config):
+    """Where the keyboard_status library actually is.
+
+    `--install` and `--uninstall` are the two commands that deliberately do
+    not re-exec into the venv -- they have to run before it exists -- so they
+    run under whatever `python3` the user typed, and that interpreter usually
+    has no PyYAML. load_config() then returns pure defaults *silently*, and
+    `upstream_path` comes out as the ~/projects/... default no matter what the
+    installer wrote into the YAML. On a fresh machine that directory does not
+    exist and `pip install -e` on it aborts the install.
+
+    So: if the library is sitting beside this file -- which is exactly what
+    the one-command installer arranges, and the only reason those two files
+    are copied into INSTALL_DIR -- believe the directory over the config we
+    may not have been able to read. A clone checkout has neither file and
+    falls through to the configured sibling path, unchanged.
+    """
+    beside = os.path.join(REPO_DIR, "keyboard_status.py")
+    if os.path.exists(beside) and os.path.exists(os.path.join(REPO_DIR, "pyproject.toml")):
+        return REPO_DIR
+    return os.path.expanduser(config["upstream_path"])
+
+
 def import_stack(config):
     """Import keyboard_status (installed or from the sibling checkout), then
     the local modules that depend on it."""
     try:
         import keyboard_status  # noqa: F401
     except ImportError:
-        sys.path.insert(0, os.path.expanduser(config["upstream_path"]))
+        sys.path.insert(0, upstream_dir(config))
         import keyboard_status  # noqa: F401
+    # keyboard_status hardcodes the macOS system faces and resolves them out of
+    # its own globals on every font() call, so off macOS they are repointed
+    # here -- one place, before any renderer has asked for a glyph. No-op on
+    # macOS, where the faces it names are the right ones.
+    service.apply_font_fallback(keyboard_status, warn=log)
     if REPO_DIR not in sys.path:
         sys.path.insert(0, REPO_DIR)
     import collect
@@ -233,8 +273,8 @@ def require_url(cfg):
         "Find it on the keyboard's own display or settings app, or look for a\n"
         "new device in your router's client list. Then restart the daemon:\n"
         "\n"
-        "    launchctl kickstart -k gui/%d/%s\n"
-        % (CONFIG_PATH, os.getuid(), LAUNCH_LABEL))
+        "    %s\n"
+        % (CONFIG_PATH, service.restart_command(LAUNCH_LABEL)))
     return 2
 
 
@@ -778,7 +818,13 @@ def launchctl(*args, **kwargs):
 
 
 def boot_out_old_agent():
-    """Single-pusher rule: exactly one daemon may own the panel."""
+    """Single-pusher rule: exactly one daemon may own the panel.
+
+    macOS only: the old repo's pusher is a launchd agent, so off macOS there
+    is nothing that could be holding the panel and nothing to boot out.
+    """
+    if not service.is_macos():
+        return
     if launchctl("bootout", "gui/%d/%s" % (os.getuid(), OLD_LABEL)):
         log("booted out %s (single-pusher rule)" % OLD_LABEL)
 
@@ -794,16 +840,19 @@ def ensure_venv(cfg):
     if not os.path.exists(python):
         print("creating virtualenv at %s" % VENV_PATH)
         subprocess.run([sys.executable, "-m", "venv", VENV_PATH], check=True)
-    probe = subprocess.run([python, "-c", "import PIL, yaml, Quartz, keyboard_status"],
-                           capture_output=True)
+    # pyobjc is the hotkey listener's dependency and macOS-only -- there is no
+    # Linux wheel and no reason to want one, since keys.py does not run there.
+    wanted = ["Pillow", "PyYAML"] + (["pyobjc-framework-Quartz"]
+                                     if service.is_macos() else [])
+    modules = "PIL, yaml, keyboard_status" + (", Quartz" if service.is_macos() else "")
+    probe = subprocess.run([python, "-c", "import " + modules], capture_output=True)
     if probe.returncode != 0:
-        print("installing dependencies (Pillow, PyYAML, pyobjc-Quartz, keyboard_status)")
+        print("installing dependencies (%s, keyboard_status)" % ", ".join(wanted))
         subprocess.run([python, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
                        check=False)
-        subprocess.run([python, "-m", "pip", "install", "--quiet", "Pillow", "PyYAML",
-                        "pyobjc-framework-Quartz"], check=True)
+        subprocess.run([python, "-m", "pip", "install", "--quiet"] + wanted, check=True)
         subprocess.run([python, "-m", "pip", "install", "--quiet", "-e",
-                        os.path.expanduser(cfg["upstream_path"])], check=True)
+                        upstream_dir(cfg)], check=True)
     return python
 
 
@@ -848,11 +897,11 @@ def install(cfg, with_agent=True, with_keys=True):
     if not hooks_registered():
         print("WARNING: the claude-code-keyboard-status hooks are not registered.")
         print("Run: python3 %s --install" %
-              os.path.expanduser("%s/keyboard_status.py" % cfg["upstream_path"]))
+              os.path.join(upstream_dir(cfg), "keyboard_status.py"))
         print("(they own the state file this display reads; without them the")
         print(" panel cannot tell a permission prompt from ongoing work)")
 
-    if with_agent:
+    if with_agent and service.is_macos():
         write_plist(python)
         domain = "gui/%d" % os.getuid()
         launchctl("bootout", "%s/%s" % (domain, OLD_LABEL))
@@ -861,9 +910,31 @@ def install(cfg, with_agent=True, with_keys=True):
             launchctl("unload", LAUNCH_PLIST)
             launchctl("load", "-w", LAUNCH_PLIST, quiet=False)
         print("loaded launchd agent %s (and booted out %s)" % (LAUNCH_LABEL, OLD_LABEL))
+    elif with_agent and service.is_linux():
+        service.install_service(python, LOG_PATH,
+                                script=os.path.join(REPO_DIR, "display.py"))
+    elif with_agent:
+        print("no service manager known for %s; run the daemon yourself:"
+              % (service.system_name() or "this platform"))
+        print("    %s %s --daemon" % (python, os.path.join(REPO_DIR, "display.py")))
     print("logs: %s" % LOG_PATH)
+    if not service.is_macos():
+        # macOS says this in the README and in `launchctl print`; the systemd
+        # verbs are the ones nobody can guess, so they are printed where the
+        # install ends rather than left to be looked up.
+        for line in service.status_commands():
+            print("      %s" % line)
 
-    if with_keys:
+    # keys.py is a macOS listener and nothing else -- see service.hotkeys_supported.
+    # Saying so here, once, is the whole Linux hotkey story: not a failure, not
+    # a silent omission, and not a half-listener that never fires.
+    if with_keys and not service.hotkeys_supported():
+        print("")
+        print("global hotkeys: not supported on %s -- skipped."
+              % (service.system_name() or "this platform"))
+        print("Drive the panel with the same command the hotkey runs:")
+        print("    python3 %s mode next" % os.path.join(REPO_DIR, "display.py"))
+    elif with_keys:
         # Imported here, not at module scope: keys imports this module, and it
         # is the only part of the install that can fail on a privacy grant.
         import keys
@@ -874,6 +945,11 @@ def install(cfg, with_agent=True, with_keys=True):
 
 
 def uninstall():
+    if not service.is_macos():
+        if service.is_linux():
+            service.uninstall_service()
+        print("left %s and the venv in place" % CONFIG_PATH)
+        return
     domain = "gui/%d" % os.getuid()
     launchctl("bootout", "%s/%s" % (domain, LAUNCH_LABEL))
     launchctl("unload", LAUNCH_PLIST)

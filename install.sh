@@ -11,8 +11,17 @@
 # session state through into ~/.claude/context-keyboard-display/, writes a config
 # pointing at your panel, registers the five session hooks in
 # ~/.claude/settings.json (preserving every other setting and every other tool's
-# hooks), and loads the launchd agents. Safe to re-run; that is also how you
-# upgrade, and a re-run keeps the address you already configured.
+# hooks), and starts the daemon. Safe to re-run; that is also how you upgrade,
+# and a re-run keeps the address you already configured.
+#
+# Two hosts, one script:
+#
+#   macOS            launchd agents for the display and for the keys.py global
+#                    hotkey listener -- unchanged from before this script grew
+#                    a second platform.
+#   Ubuntu/Debian    a systemd --user service for the display. No hotkey
+#                    listener: keys.py is macOS-only and is skipped, which is a
+#                    skipped step and not a failure.
 #
 #   PANEL_IP           the keyboard's address. Asked for interactively if unset.
 #   CKD_SOURCE         where to fetch the display from. Default: this repo on
@@ -21,6 +30,9 @@
 #   CKS_SOURCE         same, for the claude-code-keyboard-status library
 #   DRY_RUN=1          fetch and verify everything, then stop before installing
 #   INSTALL_DIR        where the files land (default ~/.claude/context-keyboard-display)
+#   CKD_PLATFORM       override the detected OS ("Darwin" / "Linux"). A test
+#                      hook -- it drives the other platform's branch from this
+#                      one, and is honoured by display.py and service.py too.
 set -eu
 
 CKD_BASES="${CKD_SOURCE:-}"
@@ -49,13 +61,27 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required. Install it and 
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' ||
 	fail "python3 3.9 or newer is required (found $(python3 -V 2>&1))."
 
-python3 -c 'import venv' 2>/dev/null ||
-	fail "python3 is missing the venv module. On Debian/Ubuntu: apt install python3-venv."
+# `import venv` is the wrong probe on Debian/Ubuntu: the module is in the
+# stdlib package and imports cleanly, while `python3 -m venv` still dies on a
+# missing ensurepip -- which is what the python3-venv package actually carries.
+python3 -c 'import venv, ensurepip' 2>/dev/null || fail "python3 cannot create a
+virtualenv: the venv/ensurepip modules are missing. On Debian/Ubuntu they live
+in a separate package:
 
-case "$(uname -s)" in
-Darwin) ;;
-*) fail "this display drives a macOS launchd agent and Claude Code's macOS hooks." ;;
+    sudo apt install python3-venv        # or python3.12-venv, matching python3 -V
+
+No sudo? Any of these works without it -- ask an administrator to install that
+package, or use a python3 that ships venv complete (pyenv, uv, conda) by
+putting it first on PATH and re-running this script."
+
+OS="${CKD_PLATFORM:-$(uname -s)}"
+case "$OS" in
+Darwin) service_kind="launchd agent"; hotkeys="yes" ;;
+Linux) service_kind="systemd --user service"; hotkeys="no" ;;
+*) fail "unsupported platform '$OS'. This installs a macOS launchd agent or a
+Linux systemd --user service; there is no third path." ;;
 esac
+export CKD_PLATFORM="$OS"
 
 # A source can fail -- with CKD_SOURCE / CKS_SOURCE naming several, we fall
 # through to the next -- so their diagnostics are suppressed. Only the final
@@ -96,6 +122,7 @@ note "downloading the display..."
 get "$CKD_BASES" display.py          'Context-aware display daemon'
 get "$CKD_BASES" collect.py          'def collect_sessions'
 get "$CKD_BASES" screens.py          'def claude_working'
+get "$CKD_BASES" service.py          'def unit_text'
 get "$CKD_BASES" keys.py             'RegisterEventHotKey'
 get "$CKD_BASES" config.example.yaml 'context-keyboard-display configuration'
 get "$CKD_BASES" requirements.txt    'Pillow'
@@ -152,17 +179,23 @@ esac
 
 if [ "${DRY_RUN:-0}" != "0" ]; then
 	note "DRY_RUN: verified $(ls "$tmp_dir" | wc -l | tr -d ' ') files, resolved url to $url"
+	note "DRY_RUN: platform $OS -> $service_kind"
+	note "DRY_RUN: global hotkeys: $hotkeys"
 	note "DRY_RUN: would install into $INSTALL_DIR"
 	exit 0
 fi
 
 # ------------------------------------------------------------------- install
 mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
-for f in display.py collect.py screens.py keys.py config.example.yaml \
-	requirements.txt keyboard_status.py pyproject.toml; do
+# keys.py lands on Linux too, unused: running it there prints why there is no
+# hotkey listener, which is a better answer than "no such file".
+count=0
+for f in display.py collect.py screens.py service.py keys.py \
+	config.example.yaml requirements.txt keyboard_status.py pyproject.toml; do
 	cp "$tmp_dir/$f" "$INSTALL_DIR/$f" || fail "cannot write $INSTALL_DIR/$f"
+	count=$((count + 1))
 done
-note "installed 8 files into $INSTALL_DIR"
+note "installed $count files into $INSTALL_DIR"
 
 # The config is written before either --install runs, so no daemon ever starts
 # against the placeholder address. A re-run keeps an address you already set
@@ -224,7 +257,26 @@ PYEOF
 # The library owns the session hooks and the state file this display reads, so
 # it is installed first -- the display warns if the hooks are missing.
 note "installing the session hooks..."
-python3 "$INSTALL_DIR/keyboard_status.py" --install
+if [ "$OS" = "Darwin" ]; then
+	python3 "$INSTALL_DIR/keyboard_status.py" --install
+else
+	# That library is macOS-first: its installer writes a launchd plist and
+	# prints "loaded launchd agent" whether or not launchd exists, because its
+	# launchctl wrapper swallows the "no such command" and returns False. On
+	# Linux nothing is loaded and nothing could be. The hooks -- the only part
+	# this display needs from it -- are pure Claude Code settings.json edits
+	# and do register, so the step is kept and only that one line is corrected.
+	# Captured rather than piped so a real failure still fails the install.
+	if ! python3 "$INSTALL_DIR/keyboard_status.py" --install >"$tmp_dir/hooks.out" 2>&1; then
+		cat "$tmp_dir/hooks.out" >&2
+		fail "the claude-code-keyboard-status installer failed; without its hooks
+the panel cannot tell a permission prompt from ongoing work."
+	fi
+	sed 's|^loaded launchd agent .*|(no launchd here, so nothing was loaded -- and nothing needs to be: this display is the panel'"'"'s pusher, under systemd)|' "$tmp_dir/hooks.out"
+	# The plist it wrote is inert here and only misleads whoever finds it.
+	rm -f "$HOME/Library/LaunchAgents/com.williamliu.claude-keyboard-status.plist"
+	rmdir "$HOME/Library/LaunchAgents" "$HOME/Library" 2>/dev/null || true
+fi
 
 note "installing the display..."
 python3 "$INSTALL_DIR/display.py" --install
@@ -234,8 +286,15 @@ python3 "$INSTALL_DIR/display.py" --install
 # A warning, never a failure: installing before the keyboard is plugged in is a
 # perfectly normal order to do this in, and the daemon retries on its own.
 host="$(printf '%s' "$url" | sed -e 's|^https\{0,1\}://||' -e 's|[:/].*$||')"
+# -t is a deadline on macOS and a TTL on Linux, where the deadline is -W. Using
+# the wrong one is a two-hop probe pretending to be a two-second one.
+if [ "$OS" = "Linux" ]; then
+	ping_timeout="-W 2"
+else
+	ping_timeout="-t 2"
+fi
 printf '\n'
-if ping -c 1 -t 2 "$host" >/dev/null 2>&1; then
+if ping -c 1 $ping_timeout "$host" >/dev/null 2>&1; then
 	note "panel at $host answers ping."
 elif curl -fsS -m 3 -o /dev/null "$url" 2>/dev/null; then
 	note "panel at $host answers HTTP."
@@ -244,10 +303,20 @@ else
 	printf 'install: that is fine if the keyboard is not plugged in or awake.\n' >&2
 	printf 'install: the daemon retries by itself; check with\n' >&2
 	printf 'install:     tail -f ~/.claude/context-keyboard-display.log\n' >&2
+	if [ "$OS" = "Linux" ]; then
+		printf 'install:     systemctl --user status context-keyboard-display.service\n' >&2
+	fi
 	printf 'install: if the address is wrong, edit url in %s\n' "$CONFIG_PATH" >&2
 fi
 
 printf '\n'
 note "done. The panel updates within about five seconds of a session changing."
 note "logs:   tail -f ~/.claude/context-keyboard-display.log"
-note "hotkey: Ctrl+Opt+Cmd+K cycles screens, Ctrl+Opt+Cmd+J walks the session list"
+if [ "$hotkeys" = "yes" ]; then
+	note "hotkey: Ctrl+Opt+Cmd+K cycles screens, Ctrl+Opt+Cmd+J walks the session list"
+else
+	note "status: systemctl --user status context-keyboard-display.service"
+	note "        journalctl --user -u context-keyboard-display.service -f"
+	note "restart: systemctl --user restart context-keyboard-display.service"
+	note "screens: python3 $INSTALL_DIR/display.py mode next   (no global hotkey on Linux)"
+fi
