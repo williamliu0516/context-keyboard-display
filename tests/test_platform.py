@@ -13,10 +13,14 @@ What this deliberately does NOT claim: that the unit starts, that systemd
 accepts it, or that a panel updates. Those need an Ubuntu box.
 """
 
+import contextlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -164,12 +168,88 @@ class Fonts(unittest.TestCase):
         present = set(present)
         return lambda path: path in present
 
-    def test_prefers_the_variable_noto_face(self):
+    # What the container actually has installed, which is the case that
+    # decides what the panel looks like in production.
+    CONTAINER_FONTS = (
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans[wdth,wght].ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    )
+
+    def test_the_container_stack_resolves_to_the_approved_ubuntu_faces(self):
+        """The whole point of the change: with everything the image installs
+        present, both latin roles land on Ubuntu Bold and CJK on Noto Sans CJK
+        Bold -- the exact triple that rendered the approved
+        out/docker-font-options/04-ubuntu.png. Noto Sans and DejaVu are
+        installed too and must lose."""
+        choice = service.font_choice(exists=self.only(*self.CONTAINER_FONTS))
+        self.assertEqual(choice["FONT_TEXT"],
+                         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf")
+        self.assertEqual(choice["FONT_ROUNDED"],
+                         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf")
+        self.assertEqual(choice["FONT_CJK"],
+                         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")
+        self.assertTrue(choice["has_cjk"])
+        self.assertTrue(choice["is_ubuntu"])
+
+    def test_neither_latin_role_is_generic_noto_or_dejavu_in_the_container(self):
+        """Stated as the prohibition rather than as the preference, because
+        this is the regression that would be invisible on the panel until
+        someone looked at it: Noto Regular renders, it just renders wrong."""
+        choice = service.font_choice(exists=self.only(*self.CONTAINER_FONTS))
+        for role in ("FONT_TEXT", "FONT_ROUNDED"):
+            lowered = choice[role].lower()
+            self.assertNotIn("noto", lowered, role)
+            self.assertNotIn("dejavu", lowered, role)
+            self.assertIn("/ubuntu/", lowered, role)
+
+    def test_bold_beats_the_lighter_ubuntu_faces(self):
+        """Ubuntu is static-only, so weight is chosen by file. The renderer
+        asks for 700 nearly everywhere; Regular would quietly flatten the
+        panel, which is exactly what the Noto stack this replaces did."""
+        choice = service.font_choice(exists=self.only(
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf"))
+        self.assertTrue(choice["FONT_TEXT"].endswith("Ubuntu-B.ttf"))
+        self.assertTrue(choice["FONT_ROUNDED"].endswith("Ubuntu-B.ttf"))
+
+    def test_the_two_latin_roles_cannot_land_on_different_families(self):
+        """A mixed panel -- rounded on one family, the footer clock on another
+        -- is the failure mode of two independently ordered lists."""
+        self.assertEqual(service.LINUX_TEXT_FONTS, service.LINUX_ROUNDED_FONTS)
+
+    def test_cjk_prefers_bold_to_sit_beside_the_bold_latin_face(self):
+        choice = service.font_choice(exists=self.only(
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"))
+        self.assertTrue(choice["FONT_CJK"].endswith("NotoSansCJK-Bold.ttc"))
+
+    def test_cjk_falls_back_to_regular_noto_cjk_when_bold_is_absent(self):
+        """A working CJK fallback matters more than its weight: the wrong
+        weight is a blemish, no CJK face at all is tofu."""
+        choice = service.font_choice(exists=self.only(
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"))
+        self.assertTrue(choice["FONT_CJK"].endswith("NotoSansCJK-Regular.ttc"))
+        self.assertTrue(choice["has_cjk"])
+        self.assertTrue(choice["is_ubuntu"])
+
+    def test_ubuntu_missing_degrades_to_noto_rather_than_refusing(self):
+        """fonts-ubuntu is in non-free, so a plain Debian box can legitimately
+        not have it. That host still renders -- it just does not claim to be
+        the approved look."""
         choice = service.font_choice(exists=self.only(
             "/usr/share/fonts/truetype/noto/NotoSans[wdth,wght].ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
         self.assertIn("NotoSans[wdth,wght]", choice["FONT_TEXT"])
         self.assertIn("NotoSans[wdth,wght]", choice["FONT_ROUNDED"])
+        self.assertFalse(choice["is_ubuntu"])
 
     def test_falls_back_to_dejavu(self):
         choice = service.font_choice(exists=self.only(
@@ -255,6 +335,85 @@ def run(argv, platform=None, expect=None):
                              % (argv, proc.returncode, expect,
                                 proc.stdout, proc.stderr))
     return proc
+
+
+class FontsStrictGate(unittest.TestCase):
+    """`--fonts --strict` is what the image build runs, so it is the thing
+    standing between a Dockerfile edit and a panel silently rendering in the
+    wrong face. Driven through main() over a fake font tree, because the whole
+    question is "what does this host have", and this host is a Mac."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ckd-fonts-")
+        self.saved = {name: getattr(service, name) for name in
+                      ("UBUNTU_DIR", "UBUNTU_TEXT_FONT", "LINUX_TEXT_FONTS",
+                       "LINUX_ROUNDED_FONTS", "LINUX_CJK_FONTS")}
+        self.ubuntu_dir = os.path.join(self.root, "ubuntu")
+        self.noto_dir = os.path.join(self.root, "noto")
+        os.makedirs(self.ubuntu_dir)
+        os.makedirs(self.noto_dir)
+        self.ubuntu_b = os.path.join(self.ubuntu_dir, "Ubuntu-B.ttf")
+        self.noto = os.path.join(self.noto_dir, "NotoSans-Regular.ttf")
+        self.cjk = os.path.join(self.noto_dir, "NotoSansCJK-Bold.ttc")
+        service.UBUNTU_DIR = self.ubuntu_dir
+        service.UBUNTU_TEXT_FONT = self.ubuntu_b
+        service.LINUX_TEXT_FONTS = (self.ubuntu_b, self.noto)
+        service.LINUX_ROUNDED_FONTS = service.LINUX_TEXT_FONTS
+        service.LINUX_CJK_FONTS = (self.cjk,)
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(service, name, value)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def touch(self, *paths):
+        for path in paths:
+            with open(path, "wb") as handle:
+                handle.write(b"")
+
+    def run_fonts(self, *flags):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = service.main(["service.py", "--fonts"] + list(flags))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_approved_stack_passes(self):
+        self.touch(self.ubuntu_b, self.noto, self.cjk)
+        code, out, err = self.run_fonts("--strict")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Ubuntu-B.ttf", out)
+        self.assertIn("NotoSansCJK-Bold.ttc", out)
+        self.assertEqual(err, "")
+
+    def test_a_non_ubuntu_latin_face_fails_the_gate(self):
+        """The regression the build has to catch: everything renders, so
+        nothing else would notice."""
+        self.touch(self.noto, self.cjk)
+        code, out, err = self.run_fonts("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("fonts-ubuntu", err)
+        self.assertIn("NotoSans-Regular.ttf", out)
+
+    def test_a_missing_cjk_face_fails_the_gate(self):
+        self.touch(self.ubuntu_b)
+        code, out, err = self.run_fonts("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("fonts-noto-cjk", err)
+
+    def test_without_strict_a_degraded_host_still_reports_success(self):
+        """Run time, not build time: the container entrypoint prints this on
+        every start, and a Debian box that legitimately has no fonts-ubuntu
+        must not be stopped from starting the daemon by a diagnostic."""
+        self.touch(self.noto, self.cjk)
+        code, out, err = self.run_fonts()
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+    def test_no_fonts_at_all_still_fails_either_way(self):
+        for flags in ((), ("--strict",)):
+            code, out, _ = self.run_fonts(*flags)
+            self.assertEqual(code, 1, flags)
+            self.assertIn("no usable font found", out)
 
 
 class CLI(unittest.TestCase):

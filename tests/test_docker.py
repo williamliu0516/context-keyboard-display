@@ -474,18 +474,37 @@ class DockerfileText(unittest.TestCase):
     def test_fonts_are_installed_and_verified_at_build_time(self):
         """Font substitution is the one thing a Linux container gets wrong
         silently, so the build fails rather than the panel rendering tofu."""
+        self.assertIn("fonts-ubuntu", self.text)
         self.assertIn("fonts-noto-core", self.text)
         self.assertIn("fonts-dejavu-core", self.text)
         self.assertIn("fonts-noto-cjk", self.text)
         self.assertIn("service.py --fonts", self.text)
         self.assertIn("--preview /tmp/buildcheck", self.text)
 
+    def test_the_approved_face_is_installed_and_gated_not_merely_hoped_for(self):
+        """fonts-ubuntu lives in Debian non-free, so the component has to be
+        enabled or the install silently is not there; --fonts --strict is what
+        turns "the resolved face is Ubuntu" from a hope into a build failure."""
+        self.assertRegex(self.text, r"Components:.*non-free")
+        self.assertIn("service.py --fonts --strict", self.text)
+
     def test_the_installed_faces_are_ones_service_py_looks_for(self):
         """The apt packages and service.py's candidate lists have to agree;
         they are in different files and would drift silently."""
         wanted = service.LINUX_TEXT_FONTS + service.LINUX_CJK_FONTS
+        self.assertTrue(any("/ubuntu/" in path.lower() for path in wanted))
         self.assertTrue(any("noto" in path.lower() for path in wanted))
         self.assertTrue(any("dejavu" in path.lower() for path in wanted))
+
+    def test_the_primary_latin_faces_service_py_picks_first_are_ubuntu(self):
+        """Read off the same constants the image resolves at run time: the
+        head of each latin list is the face the panel is actually drawn in."""
+        for candidates in (service.LINUX_TEXT_FONTS, service.LINUX_ROUNDED_FONTS):
+            first = candidates[0].lower()
+            self.assertIn("/ubuntu/ubuntu-b.ttf", first)
+            self.assertNotIn("noto", first)
+            self.assertNotIn("dejavu", first)
+        self.assertTrue(service.LINUX_CJK_FONTS[0].endswith("NotoSansCJK-Bold.ttc"))
 
     def test_timezone_data_is_present_because_idle_is_a_clock(self):
         self.assertIn("tzdata", self.text)
@@ -613,6 +632,46 @@ class ImageContents(unittest.TestCase):
         self.assertIn("FONT_TEXT", out)
         self.assertNotIn("no usable font", out)
         self.assertNotIn("tofu", out, "the CJK face should be present")
+
+    def test_the_image_resolves_the_approved_ubuntu_stack(self):
+        """The deployed answer to "what face is the panel in": asked of the
+        built image rather than of the constants, so an apt change that drops
+        fonts-ubuntu fails here even if service.py still asks for it."""
+        out = self.run_in_image("/app/service.py", "--fonts")
+        rows = dict(line.split(None, 1) for line in out.splitlines()
+                    if line.startswith("FONT_"))
+        self.assertEqual(rows["FONT_TEXT"].strip(),
+                         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf")
+        self.assertEqual(rows["FONT_ROUNDED"].strip(),
+                         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf")
+        self.assertEqual(rows["FONT_CJK"].strip(),
+                         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")
+
+    def test_the_strict_font_gate_passes_inside_the_built_image(self):
+        proc = subprocess.run(["docker", "run", "--rm", "--entrypoint", "python3",
+                               IMAGE, "/app/service.py", "--fonts", "--strict"],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_cjk_still_draws_hanzi_beside_the_ubuntu_latin_face(self):
+        """Ubuntu has no CJK coverage at all, so the fallback is the only
+        thing between a todo written in Japanese and a row of tofu. Measured
+        through the renderer's own font() pair, at a weight above its 550
+        threshold, which is where the panel actually lives."""
+        probe = (
+            "import sys; sys.path.insert(0, '/app');"
+            "import service, keyboard_status as ks;"
+            "service.apply_font_fallback(ks);"
+            "latin, wide = ks.font(20, 700);"
+            "from PIL import Image, ImageDraw;"
+            "d = ImageDraw.Draw(Image.new('RGB', (64, 64)));"
+            "print(type(wide).__name__, int(d.textlength('\u6771\u4eac', font=wide)),"
+            " int(d.textlength('ok', font=latin)))")
+        kind, cjk_width, latin_width = self.run_in_image("-c", probe).split()
+        self.assertEqual(kind, "FreeTypeFont",
+                         "the CJK face fell back to Pillow's bitmap default")
+        self.assertGreater(int(cjk_width), 20, "CJK measured as tofu/blank")
+        self.assertGreater(int(latin_width), 0)
 
     def test_keys_py_is_absent_from_the_image(self):
         proc = subprocess.run(["docker", "run", "--rm", "--entrypoint", "test",

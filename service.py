@@ -9,6 +9,8 @@ launchd, no WindowServer to reserve a hotkey with, and no San Francisco.
     python3 service.py --platform      what this host is and what it supports
     python3 service.py --print-unit    the systemd --user unit, on stdout
     python3 service.py --fonts         the font files the Linux fallback picks
+    python3 service.py --fonts --strict  ...and fail unless they are the
+                                       approved Ubuntu + Noto CJK stack
 
 Everything here is stdlib-only and side-effect free at import, so display.py
 can import it before the venv exists. The generators (`unit_text`,
@@ -275,11 +277,27 @@ def status_commands(log_path=None):
 # `font()` call, so pointing those at a Linux face is enough -- no fork of the
 # renderer, no divergence in layout, and macOS never takes this path.
 #
-# Variable faces first: the renderer asks for weights 600-800 by setting the
-# Weight axis, and a static face silently collapses all of them into one, so
-# the pills and headings stop standing out from the body text.
+# The face is Ubuntu, picked off a rendered A/B sheet of six candidate Linux
+# stacks (out/docker-font-options/) against the identical mock screen. Ubuntu
+# ships static faces only, so the choice of *which* one is the whole design:
+# the renderer asks for weight 700 nearly everywhere and 800 for the hero
+# number, and a static face collapses every request onto itself. Bold is
+# therefore the face those requests were actually asking for -- shipping
+# Ubuntu-R would make the panel uniformly lighter than the layout intends,
+# which is exactly the bug the Noto-Regular stack it replaces had.
 
+UBUNTU_DIR = "/usr/share/fonts/truetype/ubuntu"
+UBUNTU_TEXT_FONT = UBUNTU_DIR + "/Ubuntu-B.ttf"
+
+# The generic faces below Ubuntu are degradation, not choices: a Debian box
+# without fonts-ubuntu (it is in non-free) still renders something legible
+# rather than Pillow's 11 px bitmap default. The container never reaches them
+# -- the image installs fonts-ubuntu and the build fails if the resolved face
+# is not the Ubuntu one (`service.py --fonts --strict`).
 LINUX_TEXT_FONTS = (
+    UBUNTU_TEXT_FONT,
+    UBUNTU_DIR + "/Ubuntu-M.ttf",
+    UBUNTU_DIR + "/Ubuntu-R.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans[wdth,wght].ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -287,21 +305,28 @@ LINUX_TEXT_FONTS = (
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 )
 # Rounded has no free equivalent worth chasing; the text face stands in, which
-# costs the corner radius on glyphs and nothing else.
-LINUX_ROUNDED_FONTS = (
-    "/usr/share/fonts/truetype/noto/NotoSans[wdth,wght].ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-) + LINUX_TEXT_FONTS
+# costs the corner radius on glyphs and nothing else. Same list, so the two
+# roles cannot drift onto different families and make the panel look mixed.
+LINUX_ROUNDED_FONTS = LINUX_TEXT_FONTS
+# Bold first, to sit beside a bold latin face. Weight is baked into the file
+# here rather than picked per call: FONT_CJK is one path with two indices, and
+# off macOS both of them are 0 (see font_choice), so the renderer's 550 weight
+# threshold cannot reach a second face however this list is ordered.
 LINUX_CJK_FONTS = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 )
 
 # apt package names, printed when nothing is found. No sudo is assumed and
 # none is run: this is a suggestion in a warning, not a step in the install.
-LINUX_FONT_PACKAGES = "fonts-noto-core fonts-noto-cjk fonts-dejavu-core"
+# fonts-ubuntu needs the non-free component enabled (UFL, not DFSG-free); the
+# Dockerfile does that, a host without it degrades to the Noto/DejaVu tail.
+LINUX_FONT_PACKAGES = "fonts-ubuntu fonts-noto-cjk fonts-noto-core fonts-dejavu-core"
 
 
 def _first_existing(candidates, exists):
@@ -336,6 +361,12 @@ def font_choice(exists=os.path.exists):
         "FONT_CJK_INDEX": 0,
         "FONT_CJK_BOLD_INDEX": 0,
         "has_cjk": bool(cjk),
+        # Both latin roles landed on the approved face rather than on the
+        # generic tail. The container asserts this at build time; elsewhere it
+        # is only reported, because a host without fonts-ubuntu should still
+        # run rather than refuse to.
+        "is_ubuntu": text.startswith(UBUNTU_DIR + "/") and
+                     rounded.startswith(UBUNTU_DIR + "/"),
     }
 
 
@@ -399,6 +430,13 @@ def main(argv):
                                    log_path, version=systemd_version()))
         return 0
     if command == "--fonts":
+        # --strict turns "what did this host resolve to" into a gate. The image
+        # build runs it, so a Dockerfile that stops installing fonts-ubuntu (or
+        # an apt component change that quietly drops it) fails the build rather
+        # than shipping a panel in the wrong face; plain --fonts stays
+        # informational, which is what the container entrypoint wants at run
+        # time on a host that may legitimately have degraded.
+        strict = "--strict" in args[1:]
         choice = font_choice()
         if not choice:
             print("no usable font found. apt install %s" % LINUX_FONT_PACKAGES)
@@ -407,6 +445,18 @@ def main(argv):
             print("%-14s %s" % (key, choice[key]))
         if not choice["has_cjk"]:
             print("(no CJK face:東京 renders as tofu. apt install fonts-noto-cjk)")
+        if strict:
+            problems = []
+            if not choice["is_ubuntu"]:
+                problems.append("latin faces are not the approved Ubuntu ones "
+                                "(want %s). apt install fonts-ubuntu "
+                                "(non-free)" % UBUNTU_TEXT_FONT)
+            if not choice["has_cjk"]:
+                problems.append("no CJK face. apt install fonts-noto-cjk")
+            for problem in problems:
+                sys.stderr.write("fonts --strict: %s\n" % problem)
+            if problems:
+                return 1
         return 0
     sys.stdout.write(USAGE)
     return 0 if command in ("--help", "-h") else 2

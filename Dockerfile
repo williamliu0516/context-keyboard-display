@@ -21,16 +21,32 @@ FROM python:${PYTHON_TAG}
 ARG INSTALL_CJK_FONT=1
 
 # fonts-*: service.apply_font_fallback repoints the renderer at these, since
-#   the faces keyboard_status names (SFNS, PingFang) are macOS-only. The
-#   variable NotoSans face matters specifically -- the renderer asks for
-#   weights 600-800, and a static face would collapse them all into one.
+#   the faces keyboard_status names (SFNS, PingFang) are macOS-only.
+#   fonts-ubuntu is the approved panel face and the reason for the non-free
+#   component below -- Ubuntu is UFL-licensed, which is free to use and
+#   redistribute but not DFSG-free, so Debian ships it outside main. The
+#   Noto/DejaVu pair stays as service.py's degradation tail, not as a face this
+#   image ever renders in: the --fonts --strict check below fails the build if
+#   the resolved latin faces are not the Ubuntu ones.
 # git: collect.diff_stat shells out to it for the +/- counts on the working
 #   screen (see the read-only projects mount in docker-compose.yml).
 # tzdata: the Idle screen is a clock. Without it TZ= is ignored and the panel
 #   shows UTC, which is a wrong display rather than a missing one.
+#
+# The extra .sources file is additive and repeats bookworm/main on purpose:
+# deb822 sources are per-file, so enabling non-free means restating the suite,
+# and the duplicate-target warning apt prints for it is cosmetic.
 RUN set -eux; \
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: http://deb.debian.org/debian' \
+        'Suites: bookworm' \
+        'Components: main contrib non-free' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        > /etc/apt/sources.list.d/ckd-nonfree.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+        fonts-ubuntu \
         fonts-noto-core \
         fonts-dejavu-core \
         git \
@@ -59,11 +75,23 @@ COPY docker/entrypoint.sh /usr/local/bin/ckd-entrypoint
 RUN chmod +x /usr/local/bin/ckd-entrypoint
 
 # Build-time proof that this image can actually draw, which is the one thing a
-# font-substituted container gets wrong silently: --fonts fails the build if no
-# usable face was installed, and --preview renders the whole approved-mockup
-# dataset through Pillow, the installed keyboard_status and the Linux faces.
+# font-substituted container gets wrong silently: --fonts --strict fails the
+# build unless the resolved faces are the approved Ubuntu latin pair *and* a
+# real CJK face (silently degrading to Noto is the failure this catches), and
+# --preview renders the whole approved-mockup dataset through Pillow, the
+# installed keyboard_status and those faces.
+#
+# The CJK half of --strict is conditional on the build arg that installs it:
+# INSTALL_CJK_FONT=0 is a deliberate smaller-image choice, not a regression, so
+# it downgrades the gate to the latin faces rather than failing the build.
 RUN set -eux; \
-    python3 /app/service.py --fonts; \
+    if [ "$INSTALL_CJK_FONT" = "1" ]; then \
+        python3 /app/service.py --fonts --strict; \
+    else \
+        python3 /app/service.py --fonts; \
+        python3 -c "import sys; sys.path.insert(0, '/app'); import service; \
+sys.exit(0 if service.font_choice()['is_ubuntu'] else 'latin faces are not Ubuntu')"; \
+    fi; \
     python3 /app/display.py --preview /tmp/buildcheck >/dev/null; \
     test -s /tmp/buildcheck/idle.jpg; \
     rm -rf /tmp/buildcheck
