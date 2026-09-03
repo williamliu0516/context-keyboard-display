@@ -15,6 +15,7 @@ here as a library.
     python3 display.py --preview [DIR]    render the approved-mockup dataset
     python3 display.py --live [PATH]      render the real current state once
     python3 display.py --status           dump sessions + chosen screen as JSON
+    python3 display.py --health           is the tick loop alive? (container health)
     python3 display.py mode sessions      manual override (auto|claude|sessions|idle)
     python3 display.py mode next          advance the override one step round the cycle
                                           (an override lapses back to auto after
@@ -297,6 +298,132 @@ def push_frame(ks, frame, cfg):
     return False, "%s; %s" % (note, reachability(cfg))
 
 
+# ------------------------------------------------- containerised deployment
+#
+# Two files, both env-gated, both dead code for the native launchd install
+# (which sets neither variable). They exist because a container has to answer
+# two questions the launchd agent never has to: "is this daemon actually
+# ticking?" -- there is no `launchctl print` inside a container and the log is
+# the container's stdout, so health has to be a fact on disk -- and "may I push
+# yet?", because during the migration the native pusher still owns the panel
+# and exactly one process may drive it (see boot_out_old_agent for the same
+# rule between this daemon and the old repo's).
+
+STANDBY_ENV = "CKD_STANDBY_PATH"
+HEARTBEAT_ENV = "CKD_HEARTBEAT_PATH"
+# How stale the heartbeat may get before the container is called unhealthy.
+# The daemon writes one per tick and the slowest tick is a failed push: two
+# knocks at http_timeout_seconds apiece, the retry pause, then the
+# reachability probe -- about 10 s on top of the tick itself. Four ticks with a
+# 45 s floor covers that, and stays well clear of calling a daemon whose panel
+# is merely asleep sick: an offline panel is a healthy daemon with nowhere to
+# push, and a health check that flaps on it would restart the container every
+# time the keyboard slept.
+HEALTH_STALE_FLOOR = 45.0
+# Consecutive raising ticks that mean the loop is alive but useless. One is
+# routine (a transcript rewritten mid-read); three in a row is a bug.
+HEALTH_MAX_ERRORS = 3
+
+
+def standby_path():
+    return os.environ.get(STANDBY_ENV) or ""
+
+
+def standby_active():
+    """True while somebody else owns the panel and this daemon must not push.
+
+    The migration handoff in one bit: deploy/ckd-docker.sh creates the file
+    before it starts the container, so the containerised daemon collects,
+    renders, publishes status and heartbeats -- everything the health check and
+    the verification push need -- while the native launchd pusher is still the
+    only process POSTing frames. Deleting the file hands the panel over. It is
+    read once per tick rather than at startup, so both directions take effect
+    within one tick and neither needs a restart.
+    """
+    path = standby_path()
+    return bool(path) and os.path.exists(path)
+
+
+def write_heartbeat(kind, online, last_push, standby, errors, path=None):
+    """Publish "the tick loop just went round", for the container health check.
+
+    Deliberately not the log: a health check has to be a cheap read with a
+    timestamp in it, and `docker inspect` reads this through one stdlib json
+    load with no venv behind it. Written wherever CKD_HEARTBEAT_PATH points --
+    a container-local tmpfs, not ~/.claude, because it describes one process
+    rather than the shared panel state the native daemon also writes.
+    """
+    path = path or heartbeat_path()
+    if not path:
+        return
+    payload = {
+        "at": time.time(),
+        "pid": os.getpid(),
+        "kind": kind,
+        "online": bool(online),
+        "last_push_at": last_push or None,
+        "standby": bool(standby),
+        "errors": int(errors),
+    }
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a daemon that cannot heartbeat still drives the panel
+
+
+def heartbeat_path():
+    return os.environ.get(HEARTBEAT_ENV) or ""
+
+
+def read_heartbeat(path=None):
+    path = path or heartbeat_path()
+    if not path:
+        return None
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def health_verdict(cfg, now=None, path=None):
+    """`(exit_code, one_line)` for `display.py --health`.
+
+    What it does and does not assert, because a health check that overclaims
+    gets containers restarted for no reason: it says the tick loop went round
+    recently and is not raising every time. It says nothing about the panel
+    being reachable -- the keyboard sleeps off Wi-Fi for hours by design, and
+    the daemon's whole offline path exists to survive that.
+    """
+    path = path or heartbeat_path()
+    if not path:
+        return 2, "no %s set: this daemon publishes no heartbeat" % HEARTBEAT_ENV
+    data = read_heartbeat(path)
+    if data is None:
+        return 1, "no readable heartbeat at %s yet" % path
+    at = data.get("at")
+    if not isinstance(at, (int, float)):
+        return 1, "heartbeat at %s carries no timestamp" % path
+    errors = data.get("errors")
+    if isinstance(errors, int) and errors >= HEALTH_MAX_ERRORS:
+        return 1, "tick loop is raising: %d consecutive failed ticks (see the log)" % errors
+    age = (now or time.time()) - at
+    allowed = max(cfg["tick_seconds"] * 4, HEALTH_STALE_FLOOR)
+    # A heartbeat from the future is clock skew between the VM and the host,
+    # not a stuck loop; only staleness is a symptom.
+    if age > allowed:
+        return 1, "heartbeat is %.0fs old (max %.0fs): the tick loop is stuck" % (age, allowed)
+    return 0, "ok: ticked %.0fs ago, screen %s, panel %s%s" % (
+        max(0.0, age), data.get("kind") or "?",
+        "online" if data.get("online") else "not answering",
+        ", standby (not pushing)" if data.get("standby") else "")
+
+
 # ------------------------------------------------------------------- engine
 
 
@@ -576,6 +703,11 @@ def run_daemon(cfg, once=False, dry_run=False):
     phase = 0.0
     failures = 0
     tick = cfg["tick_seconds"]
+    # Consecutive raising ticks and the standby latch: both exist only to be
+    # reported (heartbeat / one log line per transition), never to change what
+    # the loop renders.
+    errors = 0
+    standing_by = False
 
     while True:
         started = time.time()
@@ -609,12 +741,30 @@ def run_daemon(cfg, once=False, dry_run=False):
                 # not how many times it has been redrawn.
                 write_status(kind)
 
+            # Asked every tick, not once at startup: the handoff is a file
+            # appearing or disappearing under the daemon, and `--once` is the
+            # verification push itself, which is exactly the one push that has
+            # to go out while standby is in force.
+            standby = not once and standby_active()
+            if standby != standing_by:
+                standing_by = standby
+                if standby:
+                    log("standby: %s exists, so another pusher owns the panel; "
+                        "rendering but not pushing" % standby_path())
+                else:
+                    log("standby lifted: this daemon now owns the panel")
+
             if dry_run:
                 if digest != last_digest:
                     os.makedirs(os.path.dirname(dry_path), exist_ok=True)
                     with open(dry_path, "wb") as handle:
                         handle.write(frame)
                     last_digest = digest
+            elif standby:
+                # Forget what is on the panel while somebody else is drawing
+                # on it, so the first tick after the handoff pushes rather than
+                # deduplicating against a frame this process never sent.
+                last_digest = None
             else:
                 due = digest != last_digest or started - last_push >= cfg["heartbeat_seconds"]
                 if due and started >= offline_until:
@@ -633,8 +783,14 @@ def run_daemon(cfg, once=False, dry_run=False):
                             log("push failed (%s); retrying in %.0fs [%d]" % (note, wait, failures))
 
             tick = tick_for(kind, payload, started, cfg, offline_until, collect_mod)
+            errors = 0
         except Exception as error:  # noqa: BLE001 - a daemon that dies is a bug
+            errors += 1
             log("tick failed: %s: %s" % (type(error).__name__, error))
+        # After the except, so a tick that raised still heartbeats: the loop is
+        # alive, and `errors` is what tells the health check the difference
+        # between alive and working.
+        write_heartbeat(last_kind, online, last_push, standing_by, errors)
         if once:
             return 0 if (dry_run or online) else 1
         elapsed = time.time() - started
@@ -992,7 +1148,11 @@ def reexec_in_venv():
 
 
 def main(argv):
-    if (argv[1:] or ["--help"])[0] not in ("--install", "--uninstall", "--help", "-h"):
+    # --health joins the no-reexec list for the same reason --install is on it:
+    # it must work with nothing but the stdlib. It is what a container's health
+    # check runs, so it has to answer even when the render deps are what broke.
+    if (argv[1:] or ["--help"])[0] not in ("--install", "--uninstall", "--help",
+                                           "-h", "--health"):
         reexec_in_venv()
     cfg = load_config()
     args = argv[1:]
@@ -1025,6 +1185,12 @@ def main(argv):
         return live(cfg, extra[0] if extra else os.path.join(REPO_DIR, "out", "live.jpg"))
     if command == "--status":
         return show_status(cfg)
+    if command == "--health":
+        code, message = health_verdict(cfg)
+        # stdout, not the log: `docker inspect` keeps the last few health
+        # outputs, and this line is the whole point of looking there.
+        print(message)
+        return code
     if command == "mode":
         target = args[1] if len(args) > 1 else ""
         if target == "next":

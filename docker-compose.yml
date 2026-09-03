@@ -1,0 +1,100 @@
+# The containerised display daemon. One service, because exactly one process
+# may ever push to the panel -- see display.py's boot_out_old_agent and the
+# standby handoff in deploy/ckd-docker.sh.
+#
+#     deploy/ckd-docker.sh migrate     build, verify, then take over from launchd
+#     deploy/ckd-docker.sh status      who owns the panel right now
+#     deploy/ckd-docker.sh rollback    hand it back to the native launchd agent
+#
+# Host-specific values (uid, timezone, where the sibling checkout and your
+# projects live) come from .env, which is not tracked -- `ckd-docker.sh env`
+# writes it. The panel's own address is NOT here: it stays in
+# ~/.claude/context-keyboard-display.yaml, read live through the mount, so no
+# tracked file in this repo learns your LAN.
+name: context-keyboard-display
+
+services:
+  display:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        # The renderer library, copied into the image at build time. Relative
+        # to this file, so a clone beside claude-code-keyboard-status needs no
+        # .env at all.
+        upstream: ${CKD_UPSTREAM_PATH:-../claude-code-keyboard-status}
+      args:
+        PYTHON_TAG: ${CKD_PYTHON_TAG:-3.13-slim-bookworm}
+        INSTALL_CJK_FONT: ${CKD_INSTALL_CJK_FONT:-1}
+    image: context-keyboard-display:local
+    container_name: ckd-display
+
+    # The whole point of the Docker deployment: unless-stopped brings the
+    # daemon back after a crash, after Docker Desktop restarts, and after the
+    # Mac reboots -- without re-running anything. It stays down only if it was
+    # stopped on purpose, which is what rollback does. The login/wake
+    # LaunchAgent (ckd-docker.sh agent-install) covers the one case a restart
+    # policy cannot: Docker Desktop itself not being up yet.
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+
+    # The host user, so everything written through the ~/.claude mount keeps
+    # the ownership the native daemon and the hotkey listener expect.
+    user: "${CKD_UID:-502}:${CKD_GID:-20}"
+
+    environment:
+      HOME: /host
+      PYTHONUNBUFFERED: "1"
+      # The Idle screen is a clock: without this the panel reads UTC.
+      TZ: ${TZ:-UTC}
+      # Container-local (tmpfs), because it describes this process rather than
+      # the shared panel state under ~/.claude.
+      CKD_HEARTBEAT_PATH: /tmp/ckd/heartbeat.json
+      # While this file exists the daemon renders, publishes status and
+      # heartbeats, but pushes nothing -- the single-pusher interlock the
+      # migration uses to keep the native agent in charge until the container
+      # has proven itself.
+      CKD_STANDBY_PATH: /host/.claude/context-keyboard-display-standby
+      # collect.diff_stat runs `git -C <repo> diff HEAD --shortstat` against
+      # the read-only projects mount below. safe.directory because the checkout
+      # is not this container's to own, and OPTIONAL_LOCKS=0 so git never tries
+      # to refresh an index it cannot write.
+      GIT_OPTIONAL_LOCKS: "0"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+
+    volumes:
+      # The live Claude Code state, read-write: config and transcripts in,
+      # control (written by the native hotkey listener) in, status out. This is
+      # the one mount the daemon cannot work without.
+      - ${HOME}/.claude:/host/.claude
+      # Mounted at the same absolute path it has on the host, because the
+      # transcripts record host cwds and git is asked about them by that name.
+      # Read-only: this is only ever `git diff --shortstat`.
+      - ${CKD_PROJECTS_DIR:-${HOME}/projects}:${CKD_PROJECTS_DIR:-${HOME}/projects}:ro
+      # So --preview / --live / --daemon --dry-run land in the repo's out/ dir
+      # like they do natively.
+      - ./out:/app/out
+
+    # The heartbeat and any scratch file live here and die with the container.
+    tmpfs:
+      - /tmp
+
+    healthcheck:
+      test: ["CMD", "python3", "/app/display.py", "--health"]
+      interval: 20s
+      timeout: 10s
+      # First tick has to collect every transcript and render once; 45 s is
+      # slack over the ~2 s that takes, so a slow first start is not a failure.
+      start_period: 45s
+      retries: 3
+
+    # The daemon logs one short line per event to stderr, which compose keeps.
+    # Capped, because "runs forever" and "unbounded log" are the same bug.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

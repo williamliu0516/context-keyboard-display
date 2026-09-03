@@ -284,6 +284,66 @@ against real Ubuntu hardware or a real panel on Linux** — `systemctl enable`,
 `loginctl enable-linger`, and the actual on-panel appearance of Noto in place
 of San Francisco are all unverified.
 
+## Docker on macOS
+
+The pusher can run in a container on the same Mac, with the global hotkeys
+staying native. Full runbook: **[docs/DOCKER.md](docs/DOCKER.md)**.
+
+```
+deploy/ckd-docker.sh migrate     # build, verify, then take over from launchd
+deploy/ckd-docker.sh status      # who owns the panel right now
+deploy/ckd-docker.sh rollback    # hand it back to the native launchd agent
+```
+
+No `sudo`: every launchd verb is in the per-user `gui/$UID` domain and every
+file written is under `$HOME`.
+
+What it is arranged around is the single-pusher rule. Two daemons drawing on
+one 142x428 panel at 1 Hz reads as a flickering rendering bug, so `migrate`
+hands the panel over through an interlock rather than a hope: the container
+starts in **standby** (it collects, renders, publishes the screen it chose and
+heartbeats, but pushes nothing), then has to (1) pass the container health
+check and (2) land a real `display.py --once` frame on the real configured
+panel from inside the container. Only then is the native launchd agent booted
+out, disabled and parked — and only then is standby lifted. Any failure stops
+the container and leaves the native pusher exactly as it was, still pushing.
+`rollback` runs the mirror image, and leaves the standby file in place so a
+hand-run `docker compose up -d` cannot push behind the restored agent's back.
+
+- **Runs whenever the Mac is awake.** `restart: unless-stopped` covers crashes,
+  Docker Desktop restarts and reboots; a user LaunchAgent
+  (`ckd-docker.sh agent-install`) covers the case a restart policy cannot —
+  Docker Desktop not being up yet — by waiting for it at login (`RunAtLoad`)
+  and every 300 s while awake (`StartInterval`, which launchd also fires on
+  wake). A stale panel then refills on the next tick, exactly as it does
+  natively.
+- **The live state is shared, not copied.** `~/.claude` is bind-mounted with
+  `HOME=/host`, so `expanduser("~/.claude")` resolves to it and the container
+  reads the same config, transcripts and hotkey control file, and writes the
+  same status file back. The hotkeys keep working across the boundary.
+- **The panel address never enters this repo.** It stays in
+  `~/.claude/context-keyboard-display.yaml`, read live through the mount;
+  host-specific values live in an untracked `.env`
+  (see [.env.example](.env.example)), and `tests/test_docker.py` asserts no
+  tracked file contains the configured host.
+- **The renderer library is baked in**, copied from the sibling checkout as a
+  second build context and pip-installed, so the image has no `~/projects`
+  dependency. The macOS faces do not exist on Linux, so the build installs Noto
+  and DejaVu and *fails* if no usable face resolves — plus it renders the whole
+  mockup dataset as a build step, because font substitution is the one thing a
+  container gets wrong silently.
+- **`keys.py` is not in the image at all.** The hotkeys are a Carbon
+  reservation against WindowServer; leaving the file out makes "they never run
+  in the container" a property of the build rather than a promise here.
+
+### What is *not* claimed here
+
+`docs/DOCKER.md` lists the degradations honestly; the one to know is that the
+macOS Keychain is not reachable from a container, so the usage meters fall back
+to `~/.claude/.credentials.json` alone and can read empty where they would have
+been populated natively. Everything else the screens show comes from the
+mounted state and renders identically.
+
 ## Which session am I looking at
 
 The three detail screens end in a coloured dot and six characters. That mark is

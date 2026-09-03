@@ -1,0 +1,18 @@
+# The build copies six files by name; everything else is context weight.
+.git
+.gitignore
+.venv
+.env
+.env.example
+__pycache__
+*.pyc
+out
+tests
+docs
+deploy
+index.html
+install.sh
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
