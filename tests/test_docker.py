@@ -306,8 +306,8 @@ class FakeCollect:
 
 
 class FakeEngine:
-    def __init__(self, collect_mod):
-        pass
+    def __init__(self, collect_mod, home=None):
+        self.views = {}
 
     def choose(self, sessions, now, cfg):
         return "idle", None
@@ -461,7 +461,7 @@ class DockerfileText(unittest.TestCase):
 
     def test_the_daemon_modules_are_all_there(self):
         copied = " ".join(re.findall(r"^COPY (.+)$", self.text, re.M))
-        for module in ("display.py", "collect.py", "screens.py", "service.py"):
+        for module in ("display.py", "collect.py", "screens.py", "service.py", "home.py"):
             self.assertIn(module, copied)
 
     def test_home_is_set_so_expanduser_finds_the_mount(self):

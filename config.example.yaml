@@ -24,9 +24,17 @@ jpeg_quality: 95
 active_seconds: 45.0
 # Sessions quieter than this stop existing for the display entirely.
 session_ttl_seconds: 21600.0
-# The engagement window: a finished session keeps the between-turns screen
-# (instead of dropping to Idle) for this long after its last activity.
+# The engagement window: a session counts as part of your work (and toward the
+# switchboard's "+N idle" line) for this long after its last activity.
 engaged_seconds: 1800.0
+# A finished session keeps its own switchboard row ("done 2m") this long. After
+# that it folds into "+N idle", and when nothing is active the panel drops to
+# the idle family (print, music, clock) instead of a stale DONE screen.
+done_seconds: 300.0
+# Minimum time a screen stays up before a non-urgent change replaces it. A
+# session asking for permission, a home takeover, a hotkey, or a screen that
+# has stopped being true all switch at once.
+dwell_seconds: 15.0
 
 # How long a manual override lasts ("peek" semantics). `display.py mode
 # claude|sessions|idle` — and the hotkey's `mode next` — pin the panel to one
@@ -38,8 +46,23 @@ override_ttl_seconds: 60.0
 
 usage_poll_seconds: 60.0
 diff_poll_seconds: 5.0
-# How long the DONE toast pins a just-finished session's screen.
-toast_seconds: 4.0
+
+# homeboard (the household panel's backend) feeds the strip under the Claude
+# screens and the home screens: a print in progress or failed, the next course
+# deadline, what the speaker is playing, and health checks gone bad. Leave
+# home_url empty to turn all of it off; the panel then shows clocks there.
+# homeboard guards /api with a token: put it alone in a file only you can read
+# (chmod 600) and point home_token_file at it.
+home_url: ""
+home_token_file: ""
+home_poll_seconds: 10.0
+# A new home event (bad health check, failed print, deadline threshold) takes
+# the whole screen this long; after that the strip carries it.
+takeover_seconds: 60.0
+# Deadlines show in the strip this many days out, and take the screen once at
+# each of these thresholds.
+due_strip_days: 3.0
+due_takeover_hours: [48, 24, 6, 1]
 
 # Where the claude-code-keyboard-status checkout lives (imported as a library).
 upstream_path: ~/projects/claude-code-keyboard-status

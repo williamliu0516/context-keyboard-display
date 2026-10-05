@@ -122,6 +122,7 @@ note "downloading the display..."
 get "$CKD_BASES" display.py          'Context-aware display daemon'
 get "$CKD_BASES" collect.py          'def collect_sessions'
 get "$CKD_BASES" screens.py          'def claude_working'
+get "$CKD_BASES" home.py             'class Home'
 get "$CKD_BASES" service.py          'def unit_text'
 get "$CKD_BASES" keys.py             'RegisterEventHotKey'
 get "$CKD_BASES" config.example.yaml 'context-keyboard-display configuration'
@@ -190,7 +191,7 @@ mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
 # keys.py lands on Linux too, unused: running it there prints why there is no
 # hotkey listener, which is a better answer than "no such file".
 count=0
-for f in display.py collect.py screens.py service.py keys.py \
+for f in display.py collect.py screens.py service.py home.py keys.py \
 	config.example.yaml requirements.txt keyboard_status.py pyproject.toml; do
 	cp "$tmp_dir/$f" "$INSTALL_DIR/$f" || fail "cannot write $INSTALL_DIR/$f"
 	count=$((count + 1))

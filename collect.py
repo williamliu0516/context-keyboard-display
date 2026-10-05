@@ -75,6 +75,21 @@ def engaged_sessions(sessions, now, cfg):
             or now - s.last_activity <= cfg["engaged_seconds"]]
 
 
+def recently_done(session, now, cfg):
+    """A finished turn still fresh enough to be news: within done_seconds."""
+    return (session.state not in ("working", "waiting")
+            and now - session.last_activity <= cfg["done_seconds"])
+
+
+def active_sessions(engaged, now, cfg):
+    """The sessions that get a row of their own on the switchboard -- waiting,
+    working, or just finished -- in row order. Everything else that is merely
+    engaged folds into the "+N idle" line."""
+    return ordered_sessions([s for s in engaged
+                             if s.state in ("working", "waiting")
+                             or recently_done(s, now, cfg)])
+
+
 # --------------------------------------------------------------- diff stat
 
 _DIFF_CACHE = {}
@@ -136,6 +151,16 @@ def fmt_elapsed(seconds):
         hours, minutes = divmod(minutes, 60)
         return "{}h{:02d}".format(hours, minutes)
     return "{}:{:02d}".format(minutes, secs)
+
+
+def fmt_ago(seconds):
+    """How long since something finished, in the fewest characters: 42s, 3m, 2h."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "{}s".format(seconds)
+    if seconds < 3600:
+        return "{}m".format(seconds // 60)
+    return "{}h".format(seconds // 3600)
 
 
 def fmt_duration(seconds):
@@ -212,15 +237,23 @@ def working_view(session, now, cfg, phase):
 _TOOL_PATTERN = re.compile(r"permission to use (\S+)")
 
 
-def waiting_view(session, now, cfg):
+def waiting_tool(session):
+    """"Bash?" -- the tool the permission prompt is about."""
     hook = session.hook
     message = hook.get("message") if isinstance(hook.get("message"), str) else ""
     match = _TOOL_PATTERN.search(message)
-    tool = match.group(1).strip(".,:;") if match else "Tool"
-    since = hook.get("at") if isinstance(hook.get("at"), (int, float)) else session.last_activity
+    return (match.group(1).strip(".,:;") if match else "Tool") + "?"
+
+
+def waiting_since(session):
+    hook = session.hook
+    return hook.get("at") if isinstance(hook.get("at"), (int, float)) else session.last_activity
+
+
+def waiting_view(session, now, cfg):
     return {
-        "tool": tool + "?",
-        "stuck": fmt_elapsed(now - since),
+        "tool": waiting_tool(session),
+        "stuck": fmt_elapsed(now - waiting_since(session)),
         "project": session.project,
         "clock": clock_text(now),
         "ident": ident_view(session),
@@ -314,13 +347,31 @@ def ordered_sessions(engaged):
     return sorted(engaged, key=lambda s: _SESSION_ORDER.get(s.state, 2))
 
 
-def sessions_view(engaged, now):
-    """Rows sort waiting-first, then working, then engaged-idle, each group
-    by recency (engaged_sessions already delivers recency order)."""
-    entries = ordered_sessions(engaged)
+def session_row(session, now):
+    """One switchboard row: the name, and under it what the session is doing.
+
+    The second line is two short tokens, left and right, because that is all
+    142 px holds at the floor size: the tool and how long it has been asking;
+    the turn's running time and the TODO position; or "done" and how long ago.
+    """
+    if session.state == "waiting":
+        detail = (waiting_tool(session), fmt_elapsed(now - waiting_since(session)))
+    elif session.state == "working":
+        todo = todo_view(session.facts)
+        detail = (fmt_elapsed(now - turn_started(session)), todo["count"] if todo else "")
+    else:
+        detail = ("done", fmt_ago(now - session.last_activity))
+    state = session.state if session.state in ("waiting", "working") else "done"
+    return {"state": state, "name": session.project or "--", "detail": detail}
+
+
+def sessions_view(engaged, now, cfg):
+    """Active sessions as two-line rows (waiting first, then working, then just
+    finished); the merely engaged rest is only counted."""
+    rows = active_sessions(engaged, now, cfg)
     return {
-        "entries": [(s.state if s.state in ("waiting", "working") else "engaged",
-                     s.project or "--") for s in entries],
+        "rows": [session_row(s, now) for s in rows],
+        "idle": len(engaged) - len(rows),
         "clock": clock_text(now),
     }
 

@@ -40,6 +40,7 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
+import home as home_mod  # noqa: E402
 import service  # noqa: E402
 
 CLAUDE_DIR = os.path.expanduser("~/.claude")
@@ -101,7 +102,28 @@ DEFAULTS = {
     "override_ttl_seconds": 60.0,
     "usage_poll_seconds": 60.0,
     "diff_poll_seconds": 5.0,
-    "toast_seconds": 4.0,
+    # A finished session keeps its own switchboard row ("done 2m") this long;
+    # after that it folds into "+N idle", and with nothing else going on the
+    # panel drops to the idle family instead of a stale DONE screen.
+    "done_seconds": 300.0,
+    # Minimum time a screen stays up before a *non-urgent* change replaces it.
+    # Waiting, takeovers, manual overrides and a screen that stopped being true
+    # all switch at once; this only stops two true screens trading places
+    # every few seconds, which was 37% of all screen changes before it existed.
+    "dwell_seconds": 15.0,
+    # homeboard (the household panel's backend): the strip and the home
+    # screens. Empty home_url turns all of it off.
+    "home_url": "",
+    "home_token_file": "",
+    "home_poll_seconds": 10.0,
+    # How long a home event (bad health check, failed print, deadline
+    # threshold) takes the whole screen when it first appears. After that the
+    # strip carries it.
+    "takeover_seconds": 60.0,
+    # Deadlines show in the strip this many days out, and take over the screen
+    # once at each of these thresholds.
+    "due_strip_days": 3.0,
+    "due_takeover_hours": [48, 24, 6, 1],
     # Where the claude-code-keyboard-status checkout lives (library import).
     "upstream_path": "~/projects/claude-code-keyboard-status",
     # display.aliases in the YAML lands here: {repo-basename: short-name}.
@@ -496,7 +518,7 @@ def showing_kind():
 
     The drill-down key has to know whether the switchboard is the screen
     actually on the panel, and that answer lives inside Engine.choose's
-    priority ladder — toast state and all — which is the daemon's business and
+    priority ladder — dwell and takeover state and all — which is the daemon's business and
     nobody else's. Re-deriving it in the listener would be a second copy of the
     ladder, free to drift from the first. So the daemon publishes what it
     chose and the listener reads it. If the daemon is not running the answer is
@@ -525,37 +547,98 @@ def detail_kind(session):
     return DETAIL_KINDS.get(session.state, "claude_between_turns")
 
 
-class Engine:
-    """Priority resolution per REVISED_PLAN.md §4.
+URGENT_KINDS = ("claude_waiting", "alert", "print_failed", "due_soon")
+HOME_KINDS = ("now_playing", "print", "print_failed", "alert", "due_soon")
+DETAIL_KIND_SET = ("claude_working", "claude_waiting", "claude_between_turns")
 
-    Waiting wins instantly; one working session gets its detail screen; two
-    or more concurrent anythings get the switchboard; a lone finished
-    session holds between-turns for the engagement window; Idle is the
-    floor. Done toasts pin the finishing session's between-turns screen for
-    a few seconds. There is no separate minimum-screen-lifetime timer: the
-    render tick bounds how fast a frame can be replaced (5 s on the still
-    screens, 1 s on the two that animate), and screen *kind* changes are
-    state-driven, which is what the plan's 2 s rule was guarding.
+
+class Engine:
+    """Which screen, in priority order.
+
+    1. A manual override (H/L/J/K or `display.py mode`).
+    2. Claude asking for permission: one session gets WAITING, two or more get
+       the switchboard.
+    3. A home takeover inside its announcement window: a bad health check, a
+       failed print, or a deadline crossing 48/24/6/1 h.
+    4. One session working and nothing else active: its WORKING detail.
+    5. Two or more active sessions (working, waiting, or done within
+       done_seconds): the switchboard.
+    6. One session just finished: BETWEEN-TURNS.
+    7. The idle family: a print (running or failed), else music, else the clock.
+
+    Then the dwell rule: a change between two true screens waits until the
+    current one has been up dwell_seconds. Urgent kinds, overrides, and a
+    screen that has stopped being true switch at once.
+
+    The done toast is gone: it flashed BETWEEN-TURNS for four seconds whenever
+    a session finished, and accounted for most of the panel's flicker. The
+    switchboard row ("done 12s") and the lone-session BETWEEN-TURNS screen say
+    the same thing without leaving the screen you are on.
     """
 
-    def __init__(self, collect_mod):
+    def __init__(self, collect_mod, home=None):
         self.collect = collect_mod
-        self.prev_states = {}
-        self.toast = None  # (sid, expires_at)
+        self.home = home
+        self.views = home_mod.views(None, 0)
+        self.seen = None        # takeover keys already announced; None until home answers
+        self.takeover = None    # (key, until)
+        self.shown = None       # (kind, sid, since)
+        self.mode = "auto"
 
     def choose(self, sessions, now, cfg):
-        for session in sessions:
-            if self.prev_states.get(session.sid) == "working" and session.state == "idle":
-                self.toast = (session.sid, now + cfg["toast_seconds"])
-        self.prev_states = {s.sid: s.state for s in sessions}
+        fresh = self.home is not None and self.home.fresh(now)
+        self.views = self.home.views(now) if self.home is not None else home_mod.views(None, now)
+        current = self._announce(now, cfg, fresh)
+        kind, payload = self._ladder(sessions, now, cfg, current)
+        return self._settle(kind, payload, sessions, now, cfg)
 
+    # -- home takeovers ----------------------------------------------------
+
+    def _announce(self, now, cfg, fresh):
+        """Track which home events are new. Only a fresh snapshot counts: a
+        homeboard outage must not make every event look new when it returns,
+        and whatever is already true when the daemon starts is not announced."""
+        current = {key: (kind, view) for key, kind, view in home_mod.takeover_keys(self.views, cfg)}
+        if not fresh:
+            return current
+        if self.seen is None:
+            self.seen = set(current)
+            return current
+        new = [key for key in current if key not in self.seen]
+        if new:
+            self.takeover = (new[0], now + cfg["takeover_seconds"])
+        self.seen = set(current)
+        return current
+
+    def _active_takeover(self, now, current):
+        if self.takeover is None:
+            return None
+        key, until = self.takeover
+        if now >= until or key not in current:
+            self.takeover = None
+            return None
+        return current[key]
+
+    # -- the ladder ----------------------------------------------------------
+
+    def _idle_family(self):
+        printing = self.views.get("print")
+        if printing:
+            return ("print_failed" if printing["phase"] == "failed" else "print"), printing
+        if self.views.get("music"):
+            return "now_playing", self.views["music"]
+        return "idle", None
+
+    def _ladder(self, sessions, now, cfg, current):
         engaged = self.collect.engaged_sessions(sessions, now, cfg)
-        waiting = [s for s in engaged if s.state == "waiting"]
-        working = [s for s in engaged if s.state == "working"]
+        rows = self.collect.active_sessions(engaged, now, cfg)
+        waiting = [s for s in rows if s.state == "waiting"]
+        working = [s for s in rows if s.state == "working"]
 
         mode, pinned = control_state(cfg)
+        self.mode = mode
         if mode == "idle":
-            return "idle", None
+            return self._idle_family()
         if mode == "sessions" and engaged:
             if pinned:
                 chosen = next((s for s in engaged if s.sid == pinned), None)
@@ -567,30 +650,65 @@ class Engine:
                 # chose, under a heading that says they did.
             return "sessions", engaged
         if mode == "claude" and engaged:
-            best = (waiting or working or engaged)[0]
+            best = (waiting or working or rows or engaged)[0]
             return detail_kind(best), best
 
-        if self.toast and now < self.toast[1]:
-            toasted = next((s for s in sessions if s.sid == self.toast[0]), None)
-            if toasted is not None:
-                return "claude_between_turns", toasted
         if len(waiting) == 1:
             return "claude_waiting", waiting[0]
         if len(waiting) >= 2:
             return "sessions", engaged
-        if len(working) == 1:
+        takeover = self._active_takeover(now, current)
+        if takeover is not None:
+            return takeover
+        if len(working) == 1 and len(rows) == 1:
             return "claude_working", working[0]
-        if len(working) >= 2:
+        if len(rows) >= 2:
             return "sessions", engaged
-        if len(engaged) >= 2:
-            return "sessions", engaged
-        if len(engaged) == 1:
-            return "claude_between_turns", engaged[0]
-        return "idle", None
+        if rows:
+            return "claude_between_turns", rows[0]
+        return self._idle_family()
+
+    # -- dwell ---------------------------------------------------------------
+
+    def _settle(self, kind, payload, sessions, now, cfg):
+        sid = getattr(payload, "sid", None)
+        shown = self.shown
+        if (shown is None or (kind, sid) == shown[:2] or kind in URGENT_KINDS
+                or self.mode != "auto" or now - shown[2] >= cfg["dwell_seconds"]):
+            if shown is None or (kind, sid) != shown[:2]:
+                self.shown = (kind, sid, now)
+            return kind, payload
+        held = self._hold(shown, sessions, now, cfg)
+        if held is None:
+            self.shown = (kind, sid, now)
+            return kind, payload
+        return held
+
+    def _hold(self, shown, sessions, now, cfg):
+        """The screen on the panel, rebuilt from fresh data -- or None when it
+        is no longer true and has to go now."""
+        kind, sid, _ = shown
+        engaged = self.collect.engaged_sessions(sessions, now, cfg)
+        if kind in DETAIL_KIND_SET:
+            session = next((s for s in engaged if s.sid == sid), None)
+            if session is not None and detail_kind(session) == kind:
+                return kind, session
+            return None
+        if kind == "sessions":
+            return ("sessions", engaged) if engaged else None
+        if kind == "idle":
+            return "idle", None
+        if kind == "now_playing" and self.views.get("music"):
+            return kind, self.views["music"]
+        printing = self.views.get("print")
+        if kind == "print" and printing and printing["phase"] != "failed":
+            return kind, printing
+        return None
 
 
 def render_screen(kind, payload, now, cfg, phase, online, collect_mod, screens_mod,
-                  allow_poll=True):
+                  allow_poll=True, views=None):
+    strip = home_mod.strip_item(views, cfg) if views else None
     if kind == "claude_working":
         data = collect_mod.working_view(payload, now, cfg, phase)
     elif kind == "claude_waiting":
@@ -598,9 +716,13 @@ def render_screen(kind, payload, now, cfg, phase, online, collect_mod, screens_m
     elif kind == "claude_between_turns":
         data = collect_mod.between_view(payload, now, cfg)
     elif kind == "sessions":
-        data = collect_mod.sessions_view(payload, now)
+        data = collect_mod.sessions_view(payload, now, cfg)
+    elif kind in HOME_KINDS:
+        data = home_mod.screen_data(kind, payload, now)
     else:
         data = collect_mod.idle_view(now, cfg, online, allow_poll=allow_poll)
+    if kind not in HOME_KINDS and kind != "claude_working":
+        data["strip"] = strip
     return screens_mod.RENDERERS[kind](data, cfg["aliases"])
 
 
@@ -612,7 +734,7 @@ def render_screen(kind, payload, now, cfg, phase, online, collect_mod, screens_m
 # teleports. The other screens have nothing to gain: idle's clock and its usage
 # meters are minute-resolution, sessions and between-turns hold still.
 FAST_TICK_SECONDS = 1.0
-FAST_TICK_KINDS = ("claude_working", "claude_waiting")
+FAST_TICK_KINDS = ("claude_working", "claude_waiting", "alert", "print_failed")
 # Past an hour fmt_elapsed degrades to "1h04", so the row it feeds changes once
 # a minute and the fast tick would spend 59 renders out of 60 producing the
 # frame that is already on the panel.
@@ -696,7 +818,8 @@ def run_daemon(cfg, once=False, dry_run=False):
     if not dry_run:
         boot_out_old_agent()
 
-    engine = Engine(collect_mod)
+    home = home_mod.Home(cfg, log=log)
+    engine = Engine(collect_mod, home.start() if home.enabled else None)
     dry_path = os.path.join(REPO_DIR, "out", "frame.jpg")
     last_digest = None
     last_kind = None
@@ -734,7 +857,7 @@ def run_daemon(cfg, once=False, dry_run=False):
             phase += MASCOT_RADIANS_PER_SECOND * interval
             image = render_screen(kind, payload, started, cfg, phase,
                                   online, collect_mod, screens_mod,
-                                  allow_poll=not once)
+                                  allow_poll=not once, views=engine.views)
             frame = ks.encode(image, cfg)
             digest = hashlib.sha1(frame).digest()
 
@@ -820,12 +943,16 @@ def preview(cfg, out_dir):
 def live(cfg, path):
     """Render the real current state once, to a file. The dry-run smoke test."""
     ks, collect_mod, screens_mod = import_stack(cfg)
+    home = home_mod.Home(cfg)
+    if home.enabled:
+        home.poll_once()
     now = time.time()
-    engine = Engine(collect_mod)
+    engine = Engine(collect_mod, home if home.enabled else None)
     sessions = collect_mod.collect_sessions(now, cfg)
     kind, payload = engine.choose(sessions, now, cfg)
     image = render_screen(kind, payload, now, cfg, 1.0, True,
-                          collect_mod, screens_mod, allow_poll=False)
+                          collect_mod, screens_mod, allow_poll=False,
+                          views=engine.views)
     if path.lower().endswith((".jpg", ".jpeg")):
         with open(path, "wb") as handle:
             handle.write(ks.encode(image, cfg))
@@ -837,14 +964,24 @@ def live(cfg, path):
 
 def show_status(cfg):
     _, collect_mod, _ = import_stack(cfg)
+    home = home_mod.Home(cfg)
+    if home.enabled:
+        home.poll_once()
     now = time.time()
-    engine = Engine(collect_mod)
+    engine = Engine(collect_mod, home if home.enabled else None)
     sessions = collect_mod.collect_sessions(now, cfg)
     kind, _payload = engine.choose(sessions, now, cfg)
     engaged_ids = {s.sid for s in collect_mod.engaged_sessions(sessions, now, cfg)}
     print(json.dumps({
         "screen": kind,
         "mode": control_mode(cfg),
+        "home": None if not home.enabled else {
+            "reachable": home.fresh(now),
+            "strip": (home_mod.strip_item(engine.views, cfg) or {}).get("kind"),
+            **{name: (None if view is None else
+                      {k: v for k, v in view.items() if k != "art"})
+               for name, view in engine.views.items()},
+        },
         "sessions": [{
             "sid": s.sid,
             "state": s.state,
@@ -955,7 +1092,10 @@ def select_session(cfg=None, step=1):
     now = time.time()
     engaged = collect_mod.engaged_sessions(
         collect_mod.collect_sessions(now, cfg), now, cfg)
-    order = collect_mod.ordered_sessions(engaged)
+    # The rows the switchboard draws, in its order; when every session has
+    # folded into "+N idle" there are none, and the keys walk those instead.
+    order = (collect_mod.active_sessions(engaged, now, cfg)
+             or collect_mod.ordered_sessions(engaged))
     if not order:
         return None
 

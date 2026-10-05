@@ -6,20 +6,37 @@ driven by the live state of your Claude Code sessions. The daemon decides
 multi-session switchboard, or the idle clock — renders it, and POSTs the
 JPEG to the keyboard.
 
-The three screens (six renderings):
+The screens:
 
 | Screen | When | Shows |
 |---|---|---|
-| **Claude — working** | exactly one session mid-turn | mascot (spinning = alive), BUSY pill, ⏱ turn elapsed, project, `TODO 3/7` + current item (two lines, from the session's live TodoWrite plan), diff stat `+212 −38` |
-| **Claude — waiting** | a session needs permission | waiting mascot + badge, YOU pill, ⏱ stuck-for, which tool (`Bash?`), project, clock |
-| **Claude — between turns** | a session finished, still engaged | DONE pill, last turn's duration (`2m 14s`), project, diff stat, clock |
-| **Sessions** | ≥2 sessions demand attention at once | `N LIVE` pill + one dot-and-name row per session (amber = waiting, green = working, grey = engaged), waiting-first |
-| **Idle** | no engaged session | hero clock (readable across a room), day/date, 5H/7D usage meters ("can I start another session?"), connection dot |
+| **Claude — working** | one session working and nothing else active | mascot (spinning = alive), BUSY pill, ⏱ turn elapsed, project, `TODO 3/7` + current item (two lines, from the session's live TodoWrite plan), diff stat `+212 −38` |
+| **Claude — waiting** | a session needs permission | waiting mascot + badge, YOU pill, ⏱ stuck-for, which tool (`Bash?`), project, home strip |
+| **Claude — between turns** | one session just finished, nothing else active | DONE pill, last turn's duration (`2m 14s`), project, diff stat, home strip |
+| **Sessions** | two or more sessions with something to show | `N LIVE` pill, then two lines per session — name, and what it is doing (`Bash? 0:41`, `4:32 3/7`, `done 2m`) — waiting first; quiet sessions fold into `+N idle`; home strip |
+| **Idle** | nothing active | hero clock (readable across a room), day/date, 5H/7D usage meters, home strip |
+| **Now playing** | nothing active, music playing | cover, title, artist, progress, speaker and volume |
+| **Print** | nothing active, the X1C printing | progress ring, time left, job, filament colour, ETA |
+| **Print failed** | a print stops — announced for a minute, then whenever nothing is active | red ring at the % it died, how long ago, the printer's own HMS text |
+| **Alert** | a homeboard health check turns *bad* — announced for a minute | how long, what, detail |
+| **Due soon** | a deadline crosses 48 / 24 / 6 / 1 h — announced for a minute each time | calendar tile, countdown, assignment, course, due time |
 
-Priority: waiting > done-toast > working detail > sessions > between-turns
-> idle, with a single-protagonist rule (one working session gets its detail
-screen even when others idle nearby; two of anything concurrent gets the
-switchboard).
+**The home strip** is the row the clock used to have, promoted to the one
+household thing worth a glance: a bad health check, then a failed or running
+print, then a deadline inside three days, then what is playing — else the
+clock. One item, never a rotation.
+
+Priority: manual override > waiting > a home takeover's first minute > one
+session working alone > the switchboard > one session just finished > print >
+music > idle. A change between two screens that are both still true waits
+until the current one has been up `dwell_seconds` (15 s); waiting, takeovers,
+hotkeys, and a screen that stopped being true switch at once. There is no
+DONE toast any more: it flashed between-turns for four seconds on every
+finished turn and was most of the panel's flicker — the switchboard row says
+`done 12s` without leaving the screen you are on.
+
+The household screens need homeboard (see [Home data](#home-data-homeboard));
+without it the panel has exactly the Claude screens and the clock.
 
 ## Relationship to claude-code-keyboard-status
 
@@ -403,6 +420,41 @@ authority; the colour is the fast path to it.
 screens omit it, rather than drawing a placeholder — a tag that matches nothing
 in any terminal is noise on a panel this small.
 
+## Home data (homeboard)
+
+The strip and the household screens read [homeboard]'s `GET /api/state` — the
+iPad panel's backend, which already watches the printer, the course board, the
+speakers and the health checks. `home.py` polls it every `home_poll_seconds`
+on a thread of its own; the render loop never waits on the network, and a
+snapshot older than three missed polls is dropped rather than shown frozen.
+
+```yaml
+home_url: "http://PI-ADDRESS:8800"
+home_token_file: "~/.claude/context-keyboard-display.homeboard-token"   # chmod 600, the token alone
+```
+
+homeboard guards `/api` with one shared token, sent here as a Bearer header.
+Over the plain-HTTP LAN URL it crosses the network in clear text, exactly as
+the iPad's own LAN login does.
+
+What counts, and what deliberately does not:
+
+- **Print**: running or paused jobs, and failures homeboard has not yet marked
+  stale (acknowledged, or older than its two-hour window). Cancelled jobs are
+  not failures.
+- **Deadlines**: homework, exams and projects that are not past and not
+  submitted. Homework that is only a projection (not posted yet) is skipped —
+  a countdown to a guessed date is noise.
+- **Music**: only a track that is playing; paused music is not news.
+- **Health**: only checks at level `bad`. Warnings ("unpushed commits") stay on
+  the iPad.
+- **Takeovers are announced once**: when the event first appears, and for a
+  deadline once per threshold. Whatever is already true when the daemon starts
+  is not announced, and neither is anything that merely reappears after a
+  homeboard outage.
+
+[homeboard]: https://github.com/williamliu0516/homeboard
+
 ## Hotkeys: drive the panel from the keyboard
 
 `keys.py` is a small, independent macOS hotkey listener in its own launchd
@@ -442,7 +494,7 @@ is a real precondition, not a formality: this panel has no input focus and no
 cursor, so a key that did something from any screen would be a key that does
 something you did not see. The listener finds out by reading
 `context-keyboard-display-status.json`, which the daemon writes whenever the
-screen kind changes — `Engine.choose`'s priority ladder (toast state and all)
+screen kind changes — `Engine.choose`'s priority ladder (dwell and takeover state and all)
 is the daemon's business, and re-deriving it in the listener would be a second
 copy free to drift from the first.
 
@@ -620,14 +672,12 @@ it needs the same Input Monitoring grant, and **the daemon never runs it** —
   is deliberately *not* watched: an override expiring rewrites no file, it only
   changes what `control_mode()` computes from the clock, so it stays a
   normal-tick affair.
-- **No separate minimum-screen-lifetime timer.** The tick, not a timer,
-  bounds how fast a frame can be replaced: 5 s on the still screens, 1 s on
-  working/waiting. The plan's 2 s rule survives where it matters — screen
-  *kind* changes are state-driven (a permission prompt should preempt
-  instantly) and the done toast pins between-turns for its own 4 s.
-- **Done toast = the between-turns screen pinned for 4 s** when a session
-  transitions working → idle, even if another session would otherwise own
-  the panel. No error toast: the hooks expose no error state to hang it on.
+- **A minimum screen lifetime, but only between true screens.** Measured
+  over a month, 37% of screen changes came less than 15 s after the previous
+  one, most of them the 4 s done toast. v2 drops the toast and adds
+  `dwell_seconds`: a change waits until the current screen has been up that
+  long, unless the new one is urgent (waiting, a takeover), a hotkey asked
+  for it, or the current screen is no longer true (its session moved on).
 - **`wrap_words` breaks mid-run when no space is near the cut** — CJK todo
   items carry no spaces and must fill both lines rather than collapse to
   one elided fragment. (Latin text wraps exactly as the approved mockups.)

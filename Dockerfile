@@ -70,7 +70,7 @@ WORKDIR /app
 # against WindowServer and stay a native launchd agent on the host. Leaving the
 # file out makes "hotkeys never run in the container" a property of the image
 # rather than a promise in a README.
-COPY display.py collect.py screens.py service.py config.example.yaml /app/
+COPY display.py collect.py screens.py service.py home.py config.example.yaml /app/
 COPY docker/entrypoint.sh /usr/local/bin/ckd-entrypoint
 RUN chmod +x /usr/local/bin/ckd-entrypoint
 

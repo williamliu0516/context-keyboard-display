@@ -1,4 +1,6 @@
-"""The three screens (Claude x4 variants, Sessions, Idle) for the 142x428 panel.
+"""Every screen for the 142x428 panel: Claude (working / waiting / between
+turns), Sessions, the Idle family (clock, now playing, print), and the home
+takeovers (print failed, alert, due soon).
 
 Rendering primitives — palette, fonts, mixed-script text, the mascot, the
 supersampled vector layer — are imported from keyboard_status (the
@@ -12,6 +14,8 @@ Every renderer takes a plain-dict view model (see collect.py for the live
 builders, MOCKS below for the approved-mockup data) and returns a PIL Image
 of exactly 142x428. No renderer reads the network, the clock, or any file.
 """
+
+import math
 
 from PIL import Image, ImageDraw
 
@@ -53,10 +57,6 @@ STATE_STYLE = {
     "done": ("DONE", SLEEP),
 }
 
-# Dot colours per REVISED_PLAN §3.4. GOOD rather than CLAY for working: at
-# 12 px diameter, WARN yellow and CLAY orange are too close in hue to tell
-# apart at a glance; yellow/green/grey is unambiguous.
-SESSION_DOT = {"waiting": WARN, "working": GOOD, "engaged": DIM}
 
 
 # ------------------------------------------------------------------ elision
@@ -261,19 +261,30 @@ def todo_block(canvas, y_ink, count, item, item_lines=2):
         return bottom
     item_fonts = font(FLOOR_SIZE, 700)
     top, cap = cap_box(canvas.draw, item_fonts)
-    chevron_w = measure(canvas.draw, "▸", item_fonts)
-    text_x = PAD + chevron_w + 6
+    text_x = PAD + CHEVRON_H + 7
     lines = wrap_words(canvas.draw, item, item_fonts, WIDTH - PAD - text_x,
                        INNER, item_lines)
     for index, line in enumerate(lines):
         line_ink = bottom + GAP_BAR
         if index == 0:
-            write(canvas.draw, PAD, line_ink - top, "▸", item_fonts, CLAY)
+            chevron(canvas, PAD + 1, line_ink + cap / 2, CLAY)
         line_x = text_x if index == 0 else PAD
         put(canvas, line_x, line_ink, line, item_fonts, INK,
             budget=WIDTH - PAD - line_x)
         bottom = line_ink + cap
     return bottom
+
+
+# U+25B8 is in neither Ubuntu nor Noto CJK, so on the Linux/Docker panel a typed
+# chevron rendered as a tofu box. Drawn on the vector layer it is the same
+# shape under every font.
+CHEVRON_H = 13
+
+
+def chevron(canvas, x, y_mid, tint, h=CHEVRON_H):
+    canvas.vector.polygon([(x * SS, (y_mid - h / 2) * SS),
+                           ((x + h * 0.8) * SS, y_mid * SS),
+                           (x * SS, (y_mid + h / 2) * SS)], fill=tint + (255,))
 
 
 def footer_clock(canvas, rule_y, text):
@@ -317,6 +328,188 @@ def ident_row(canvas, y_ink, ident):
                budget=WIDTH - PAD - text_x)
 
 
+def bar(canvas, x0, y, x1, h, frac, colour):
+    """Rounded track with a rounded fill, like the idle meters but any height."""
+    v = canvas.vector
+    v.rounded_rectangle([x0 * SS, y * SS, x1 * SS, (y + h) * SS],
+                        radius=h / 2 * SS, fill=FAINT + (255,))
+    filled = (x1 - x0) * max(0.0, min(1.0, frac))
+    if filled >= 1:
+        v.rounded_rectangle([x0 * SS, y * SS, (x0 + max(h, filled)) * SS,
+                             (y + h) * SS], radius=h / 2 * SS, fill=colour + (255,))
+
+
+# Strip icons: 16 px, drawn, so they survive any font.
+
+def icon_printer(canvas, x, y, s, tint):
+    v, w = canvas.vector, max(SS, round(s * 0.12 * SS))
+    v.rounded_rectangle([x * SS, y * SS, (x + s) * SS, (y + s) * SS],
+                        radius=s * 0.18 * SS, outline=tint + (255,), width=w)
+    cx = x + s / 2
+    v.polygon([((cx - s * 0.18) * SS, (y + s * 0.22) * SS),
+               ((cx + s * 0.18) * SS, (y + s * 0.22) * SS),
+               (cx * SS, (y + s * 0.50) * SS)], fill=tint + (255,))
+    v.rectangle([(x + s * 0.22) * SS, (y + s * 0.68) * SS,
+                 (x + s * 0.78) * SS, (y + s * 0.80) * SS], fill=tint + (255,))
+
+
+def icon_calendar(canvas, x, y, s, tint):
+    v, w = canvas.vector, max(SS, round(s * 0.12 * SS))
+    v.rounded_rectangle([x * SS, (y + s * 0.12) * SS, (x + s) * SS, (y + s) * SS],
+                        radius=s * 0.18 * SS, outline=tint + (255,), width=w)
+    v.rectangle([x * SS, (y + s * 0.12) * SS, (x + s) * SS, (y + s * 0.38) * SS],
+                fill=tint + (255,))
+    for fx in (0.28, 0.72):
+        v.rectangle([(x + s * fx - s * 0.06) * SS, y * SS,
+                     (x + s * fx + s * 0.06) * SS, (y + s * 0.22) * SS],
+                    fill=tint + (255,))
+
+
+def icon_note(canvas, x, y, s, tint):
+    v = canvas.vector
+    r = s * 0.22
+    disc(v, (x + r + s * 0.08) * SS, (y + s - r) * SS, r * SS, tint + (255,))
+    stem_x = x + s * 0.08 + 2 * r - s * 0.06
+    v.rectangle([stem_x * SS, (y + s * 0.08) * SS, (stem_x + s * 0.12) * SS,
+                 (y + s - r) * SS], fill=tint + (255,))
+    v.polygon([(stem_x * SS, (y + s * 0.08) * SS),
+               ((x + s * 0.95) * SS, (y + s * 0.28) * SS),
+               ((x + s * 0.95) * SS, (y + s * 0.46) * SS),
+               (stem_x * SS, (y + s * 0.30) * SS)], fill=tint + (255,))
+
+
+def icon_alert(canvas, x, y, s, tint):
+    v = canvas.vector
+    pts = [((x + s / 2) * SS, y * SS), ((x + s) * SS, (y + s * 0.92) * SS),
+           (x * SS, (y + s * 0.92) * SS)]
+    v.polygon(pts, fill=tint + (255,))
+    v.rectangle([(x + s * 0.44) * SS, (y + s * 0.30) * SS,
+                 (x + s * 0.56) * SS, (y + s * 0.62) * SS], fill=BG + (255,))
+    v.rectangle([(x + s * 0.44) * SS, (y + s * 0.70) * SS,
+                 (x + s * 0.56) * SS, (y + s * 0.80) * SS], fill=BG + (255,))
+
+
+STRIP_ICONS = {"print": icon_printer, "due": icon_calendar, "music": icon_note,
+               "alert": icon_alert}
+
+
+def strip(canvas, rule_y, item, clock=None):
+    """The home strip: the clock row, promoted to the one household thing worth
+    a glance right now (home.strip_item picks it). Falls back to the plain clock
+    when there is none, or draws nothing when `clock` is None too. Returns the
+    ink bottom.
+
+    Two lines, because 142 px at the floor size holds about seven characters: an
+    icon and the headline, then either a progress bar or a dim second line, each
+    with an optional right-aligned token (63%, 2d)."""
+    if not item:
+        return footer_clock(canvas, rule_y, clock) if clock else rule_y
+    rule(canvas, rule_y)
+    y = rule_y + 12
+    kind = item["kind"]
+    tint = item.get("tint", DIM)
+    STRIP_ICONS[kind](canvas, PAD, y + 1, 16, tint)
+    text_x = PAD + 16 + 5
+    f = font(FLOOR_SIZE, 700)
+    put(canvas, text_x, y, item["head"], f, item.get("head_tint", INK),
+        budget=WIDTH - PAD - text_x)
+    y += 18 + line_gap(item["head"]) + 2
+    right = item.get("right")
+    right_w = measure(canvas.draw, right, f) if right else 0
+    if right:
+        put(canvas, WIDTH - PAD, y, right, f, item.get("right_tint", tint),
+            align="right")
+    if item.get("frac") is not None:
+        bar(canvas, PAD, y + 5, WIDTH - PAD - right_w - 8, 8, item["frac"], tint)
+        return y + 18
+    if item.get("sub"):
+        budget = INNER - (right_w + 8 if right else 0)
+        sub = item["sub"]
+        # "CS572" beside "17h" is 4 px too wide; "572" says the same to its owner
+        if item.get("sub_alt") and measure(canvas.draw, sub, f) > budget:
+            sub = item["sub_alt"]
+        return put(canvas, PAD, y, sub, f, item.get("sub_tint", DIM), budget=budget)
+    return y + 18
+
+
+def ring(canvas, cx, cy, r, width, frac, colour):
+    """Progress ring with round caps, starting at twelve o'clock."""
+    v = canvas.vector
+    box = [(cx - r) * SS, (cy - r) * SS, (cx + r) * SS, (cy + r) * SS]
+    v.ellipse(box, outline=FAINT + (255,), width=round(width * SS))
+    frac = max(0.0, min(1.0, frac))
+    if frac <= 0:
+        return
+    v.arc(box, -90, -90 + 360 * frac, fill=colour + (255,), width=round(width * SS))
+    for angle in (-90, -90 + 360 * frac):
+        a = math.radians(angle)
+        disc(v, (cx + (r - width / 2) * math.cos(a)) * SS,
+             (cy + (r - width / 2) * math.sin(a)) * SS, width / 2 * SS, colour + (255,))
+
+
+def badge_header(canvas, draw_icon, word, tint):
+    """An icon where the mascot sits and a pill under it: the same skeleton as
+    WAITING, so a takeover reads as 'something needs you' before it is read."""
+    cx, cy, r = WIDTH / 2, MASCOT_TOP + 50, 46
+    draw_icon(canvas, cx, cy, r)
+    bottom = pill(canvas, word, tint, cy + r + GAP_MASCOT_TIGHT + 2,
+                  size=FLOOR_SIZE, pad=PILL_PAD_TIGHT)
+    return bottom + GAP_SECTION
+
+
+def glyph_ring(frac, colour, centre, centre_tint):
+    def draw(canvas, cx, cy, r):
+        ring(canvas, cx, cy, r, 10, frac, colour)
+        put(canvas, cx, cy - 12, centre, font(CORE_SIZE, 800), centre_tint, align="center")
+    return draw
+
+
+def glyph_alert(canvas, cx, cy, r):
+    v = canvas.vector
+    pts = [(cx * SS, (cy - r) * SS), ((cx + r * 1.05) * SS, (cy + r * 0.8) * SS),
+           ((cx - r * 1.05) * SS, (cy + r * 0.8) * SS)]
+    v.polygon(pts, fill=BAD + (52,))
+    v.line(pts + [pts[0]], fill=BAD + (230,), width=3 * SS, joint="curve")
+    v.rounded_rectangle([(cx - 4) * SS, (cy - r * 0.42) * SS, (cx + 4) * SS,
+                         (cy + r * 0.28) * SS], radius=4 * SS, fill=BAD + (255,))
+    disc(v, cx * SS, (cy + r * 0.53) * SS, 5 * SS, BAD + (255,))
+
+
+def glyph_calendar(month, day, tint):
+    def draw(canvas, cx, cy, r):
+        v = canvas.vector
+        x0, x1, y0, y1 = cx - r, cx + r, cy - r * 0.9, cy + r
+        v.rounded_rectangle([x0 * SS, y0 * SS, x1 * SS, y1 * SS], radius=12 * SS,
+                            fill=FAINT + (255,))
+        v.rounded_rectangle([x0 * SS, y0 * SS, x1 * SS, (y0 + 26) * SS],
+                            radius=12 * SS, fill=tint + (255,))
+        v.rectangle([x0 * SS, (y0 + 14) * SS, x1 * SS, (y0 + 26) * SS],
+                    fill=tint + (255,))
+        put(canvas, cx, y0 + 6, month, font(18, 800), BG, align="center")
+        put(canvas, cx, y0 + 37, day, font(46, 800), INK, align="center")
+    return draw
+
+
+def big_with_unit(canvas, y, number, unit, tint):
+    """"1h12 left": the number at CORE, its unit dim and smaller beside it --
+    or the number alone when a wide one leaves no room for the unit."""
+    f = font(CORE_SIZE, 800)
+    put(canvas, PAD, y, number, f, tint)
+    x = PAD + measure(canvas.draw, number, f) + 7
+    unit_font = font(20, 700)
+    if measure(canvas.draw, unit, unit_font) <= WIDTH - PAD - x:
+        put(canvas, x, y + 10, unit, unit_font, DIM)
+    return y + cap_box(canvas.draw, f)[1]
+
+
+def line_gap(text):
+    """Gap under a wrapped line. Han glyphs stand taller than the Latin cap the
+    rows are spaced by, so a CJK line needs a few more pixels of air or its
+    ink touches the line below."""
+    return GAP_BAR + (10 if any("\u2e80" <= ch <= "\u9fff" or "\uf900" <= ch <= "\uffef"
+                               for ch in text) else 0)
+
+
 # ------------------------------------------------------------------ screens
 #
 # View-model shapes (all strings pre-formatted by collect.py):
@@ -324,8 +517,10 @@ def ident_row(canvas, y_ink, ident):
 #             diff: (adds, dels)|None, clock}
 #   waiting: {tool, stuck, project, clock}
 #   between: {duration|None, project, diff: (adds, dels)|None, clock}
-#   sessions: {entries: [(state, project), ...], clock}
+#   sessions: {rows: [{state, name, detail: (left, right)}], idle, clock}
 #   idle: {hh, mm, weekday, date, meters: [(label, pct|None), ...], online}
+# plus, from home.py: `strip` on sessions / waiting / between / idle, and the
+# whole view model of now_playing / print / print_failed / alert / due_soon.
 
 
 def claude_working(data, aliases):
@@ -379,7 +574,7 @@ def claude_waiting(data, aliases):
     label = project_label(c.draw, data.get("project"), aliases,
                           font(FLOOR_SIZE, 700), INNER)
     y = put(c, PAD, y, label, font(FLOOR_SIZE, 700), DIM)
-    bottom = footer_clock(c, y + GAP_FOOTER, data["clock"])
+    bottom = strip(c, y + GAP_FOOTER, data.get("strip"), data["clock"])
     ident_row(c, bottom + GAP_FOOTER, data.get("ident"))
     return c.flatten()
 
@@ -401,46 +596,66 @@ def claude_between_turns(data, aliases):
     if diff:
         rule(c, y)
         bottom = diff_row(c, y + 12, *diff)
-    bottom = footer_clock(c, bottom + GAP_FOOTER, data["clock"])
+    bottom = strip(c, bottom + GAP_FOOTER, data.get("strip"), data["clock"])
     ident_row(c, bottom + GAP_FOOTER, data.get("ident"))
     return c.flatten()
 
 
-def sessions(data, aliases):
-    """The multi-session switchboard. No mascot: count pill, then one
-    dot + name row per session (30 px pitch, waiting-first), overflow line
-    past six, clock. The dot carries the state so the name gets the full
-    ~7-character budget."""
-    c = Canvas()
-    entries = data["entries"]
-    pill(c, "{} LIVE".format(len(entries)), CLAY, 44)
+# Dot colours per REVISED_PLAN §3.4. GOOD rather than CLAY for working: at
+# 12 px diameter, WARN yellow and CLAY orange are too close in hue to tell
+# apart at a glance; yellow/green/grey is unambiguous.
+SESSION_ROW_DOT = {"waiting": WARN, "working": GOOD, "done": SLEEP}
+SESSION_ROW_TINTS = {"waiting": (WARN, WARN), "working": (DIM, CLAY), "done": (DIM, DIM)}
+SESSION_ROWS_MAX = 4
 
-    row_fonts = font(FLOOR_SIZE, 700)
+
+def sessions(data, aliases):
+    """The switchboard: a count pill, then two lines per session that matters
+    (name; what it is doing), waiting first. Past four rows the last slot becomes
+    "+N more"; sessions that are merely engaged fold into "+N idle". The clock
+    row is the home strip.
+
+    The second line starts at the left margin, not under the name: "Bash? 0:41"
+    needs the full 122 px at the floor size in the panel's Ubuntu face."""
+    c = Canvas()
+    rows = data["rows"]
+    pill(c, "{} LIVE".format(len(rows)), CLAY, 44)
+
+    f = font(FLOOR_SIZE, 700)
+    top, cap = cap_box(c.draw, f)
     dot_r = 6
     dot_cx = PAD + dot_r
     text_x = dot_cx + dot_r + 6
-    name_budget = WIDTH - PAD - text_x
-
-    for index, (state, name) in enumerate(entries[:6]):
-        y_ink = 104 + 30 * index
-        top, cap = cap_box(c.draw, row_fonts)
-        disc(c.vector, dot_cx * SS, (y_ink + cap / 2) * SS, dot_r * SS,
-             SESSION_DOT.get(state, DIM) + (255,))
-        label = project_label(c.draw, name, aliases, row_fonts, name_budget)
-        tint = DIM if state == "engaged" else INK
-        write(c.draw, text_x, y_ink - top, label, row_fonts, tint)
-
-    if len(entries) > 6:
-        put(c, PAD, 302, "+{} MORE".format(len(entries) - 6),
-            font(FLOOR_SIZE, 700), DIM)
-
-    footer_clock(c, 334, data["clock"])
+    y = 98
+    shown = rows if len(rows) <= SESSION_ROWS_MAX else rows[:SESSION_ROWS_MAX - 1]
+    for row in shown:
+        state = row["state"]
+        disc(c.vector, dot_cx * SS, (y + cap / 2) * SS, dot_r * SS,
+             SESSION_ROW_DOT.get(state, DIM) + (255,))
+        label = project_label(c.draw, row["name"], aliases, f, WIDTH - PAD - text_x)
+        write(c.draw, text_x, y - top, label, f, INK)
+        detail_y = y + cap + 8
+        left, right = row["detail"]
+        left_tint, right_tint = SESSION_ROW_TINTS.get(state, (DIM, DIM))
+        right_w = measure(c.draw, right, f) + 4 if right else 0
+        put(c, PAD, detail_y, left, f, left_tint, budget=INNER - right_w)
+        if right:
+            put(c, WIDTH - PAD, detail_y, right, f, right_tint, align="right")
+        y = detail_y + cap + 16
+    more = len(rows) - len(shown)
+    tail = ("+{} more".format(more) if more else
+            "+{} idle".format(data["idle"]) if data.get("idle") else None)
+    if tail:
+        put(c, PAD, y - 2, tail, f, DIM)
+    strip(c, 352, data.get("strip"), data["clock"])
     return c.flatten()
 
 
 def idle(data, aliases=None):
     """The default screen: hero clock (stacked HH/MM), day/date, 5H/7D usage
-    meters ("do I have budget to start another session"), connection dot."""
+    meters ("do I have budget to start another session"), then the home strip.
+    The meters are slim bars so the strip fits; with no strip the old
+    connection dot comes back in its place."""
     c = Canvas()
     cx = WIDTH / 2
     hero = font(IDLE_CLOCK_SIZE, 800)
@@ -450,26 +665,156 @@ def idle(data, aliases=None):
     put(c, cx, 218, data["date"], font(STATE_SIZE, 700), INK, align="center")
 
     meter_font = font(FLOOR_SIZE, 700)
-    for (label, pct), label_y, bar_y in zip(data["meters"], (256, 318), (280, 342)):
+    y = 256
+    for label, pct in data["meters"]:
         if pct is None:
-            colour, reading, filled = FAINT, "--", 0.0
+            colour, reading, frac = FAINT, "--", 0.0
         else:
             pct = max(0.0, min(100.0, float(pct)))
-            colour, reading = usage_color(pct), "{:.0f}%".format(pct)
-            filled = INNER * pct / 100.0
-        put(c, PAD, label_y, label, meter_font, DIM)
-        put(c, WIDTH - PAD, label_y, reading, meter_font, colour, align="right")
-        c.vector.rounded_rectangle(
-            [PAD * SS, bar_y * SS, (WIDTH - PAD) * SS, (bar_y + BAR_H) * SS],
-            radius=BAR_H / 2 * SS, fill=FAINT + (255,))
-        if filled >= 1:
-            c.vector.rounded_rectangle(
-                [PAD * SS, bar_y * SS, (PAD + max(BAR_H, filled)) * SS,
-                 (bar_y + BAR_H) * SS],
-                radius=BAR_H / 2 * SS, fill=colour + (255,))
+            colour, reading, frac = usage_color(pct), "{:.0f}%".format(pct), pct / 100.0
+        put(c, PAD, y, label, meter_font, DIM)
+        put(c, WIDTH - PAD, y, reading, meter_font, colour, align="right")
+        bar(c, PAD, y + 25, WIDTH - PAD, 8, frac, colour)
+        y += 25 + 8 + 14
 
-    if data.get("online", True):
+    if data.get("strip"):
+        strip(c, y + 2, data["strip"])
+    elif data.get("online", True):
         disc(c.vector, cx * SS, 395 * SS, 3 * SS, FAINT + (255,))
+    return c.flatten()
+
+
+def cover_image(art, size):
+    """Centre-crop the cover to a square of `size` px, or None."""
+    if art is None:
+        return None
+    w, h = art.size
+    side = min(w, h)
+    box = ((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side)
+    return art.convert("RGB").crop(box).resize((size, size), Image.LANCZOS)
+
+
+def now_playing(data, aliases=None):
+    """Idle while music plays: cover, title (two lines), artist, progress,
+    the speaker and its volume, clock."""
+    c = Canvas()
+    art = 122
+    top = 46
+    cover = cover_image(data.get("art"), art)
+    mask = Image.new("L", (art * SS, art * SS), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, art * SS - 1, art * SS - 1],
+                                           radius=10 * SS, fill=255)
+    mask = mask.resize((art, art), Image.LANCZOS)
+    if cover is not None:
+        c.base.paste(cover, (PAD, top), mask)
+    else:
+        c.vector.rounded_rectangle([PAD * SS, top * SS, (PAD + art) * SS, (top + art) * SS],
+                                   radius=10 * SS, fill=FAINT + (255,))
+        icon_note(c, WIDTH / 2 - 22, top + art / 2 - 22, 44, DIM)
+    f = font(FLOOR_SIZE, 700)
+    y = top + art + 16
+    for line in wrap_words(c.draw, data["title"], f, INNER, INNER, 2):
+        y = put(c, PAD, y, line, f, INK) + line_gap(line)
+    if data.get("artist"):
+        y = put(c, PAD, y - GAP_BAR + 10, data["artist"], f, DIM) + GAP_SECTION
+    else:
+        y += GAP_SECTION - GAP_BAR
+    if data.get("frac") is not None:
+        bar(c, PAD, y, WIDTH - PAD, 6, data["frac"], INK)
+        y += 6 + 10
+        small = font(20, 700)
+        put(c, PAD, y, data.get("pos") or "", small, DIM)
+        y = put(c, WIDTH - PAD, y, data.get("rest") or "", small, DIM, align="right")
+        y += GAP_SECTION
+    vol = data.get("volume")
+    vol_w = measure(c.draw, vol, f) + 8 if vol else 0
+    put(c, PAD, y, data.get("source") or "", f, INK, budget=INNER - vol_w)
+    if vol:
+        put(c, WIDTH - PAD, y, vol, f, DIM, align="right")
+    y += 18
+    footer_clock(c, y + GAP_FOOTER, data["clock"])
+    return c.flatten()
+
+
+def print_progress(data, aliases=None):
+    """A print running (or paused): ring, time left, job, filament, ETA, clock."""
+    c = Canvas()
+    paused = data.get("paused")
+    tint = WARN if paused else CLAY
+    y = badge_header(c, glyph_ring(data["pct"] / 100.0, tint, "{}%".format(data["pct"]), INK),
+                     "PAUSE" if paused else "PRINT", tint)
+    if data.get("left"):
+        y = big_with_unit(c, y, data["left"], "left", INK) + GAP_SECTION
+    f = font(FLOOR_SIZE, 700)
+    y = put(c, PAD, y, data.get("file") or "--", f, DIM) + GAP_SECTION
+    if data.get("filament"):
+        rgb = data.get("filament_rgb") or DIM
+        disc(c.vector, (PAD + 7) * SS, (y + 9) * SS, 7 * SS, tuple(rgb) + (255,))
+        y = put(c, PAD + 21, y, data["filament"], f, INK, budget=WIDTH - PAD - (PAD + 21))
+    else:
+        y -= GAP_SECTION
+    rule(c, y + GAP_FOOTER)
+    y = y + GAP_FOOTER + 12
+    if data.get("eta"):
+        put(c, PAD, y, "ETA", f, DIM)
+        y = put(c, WIDTH - PAD, y, data["eta"], f, INK, align="right")
+        footer_clock(c, y + GAP_FOOTER, data["clock"])
+    else:
+        clock_font = font(CLOCK_SIZE, 600, rounded=False)
+        top, _ = cap_box(c.draw, clock_font)
+        write(c.draw, WIDTH / 2, y - 1 - top, data["clock"], clock_font, DIM, align="center")
+    return c.flatten()
+
+
+def print_failed(data, aliases=None):
+    """A print that stopped: red ring at the percentage it died at, how long it
+    has sat there, the printer's own (Chinese) HMS text, the job, clock."""
+    c = Canvas()
+    y = badge_header(c, glyph_ring(data["pct"] / 100.0, BAD, "{}%".format(data["pct"]), BAD),
+                     "FAIL", BAD)
+    if data.get("stuck"):
+        y = elapsed_row(c, y, data["stuck"], BAD) + GAP_SECTION
+    f = font(FLOOR_SIZE, 700)
+    for line in wrap_words(c.draw, data.get("error") or "--", f, INNER, INNER, 2):
+        y = put(c, PAD, y, line, f, INK) + line_gap(line)
+    y += GAP_SECTION - GAP_BAR
+    y = put(c, PAD, y, data.get("file") or "--", f, DIM)
+    footer_clock(c, y + GAP_FOOTER, data["clock"])
+    return c.flatten()
+
+
+def alert(data, aliases=None):
+    """A homeboard health check gone bad: how long, what (two lines), detail."""
+    c = Canvas()
+    y = badge_header(c, glyph_alert, "ALERT", BAD)
+    if data.get("since"):
+        y = elapsed_row(c, y, data["since"], BAD) + GAP_SECTION
+    f = font(FLOOR_SIZE, 700)
+    for line in wrap_words(c.draw, data["what"], f, INNER, INNER, 2):
+        y = put(c, PAD, y, line, f, INK) + line_gap(line)
+    if data.get("detail"):
+        y = put(c, PAD, y + 2, data["detail"], f, BAD)
+    else:
+        y -= GAP_BAR
+    footer_clock(c, y + GAP_FOOTER, data["clock"])
+    return c.flatten()
+
+
+def due_soon(data, aliases=None):
+    """A deadline inside the takeover window: calendar tile, countdown, title,
+    course, when."""
+    c = Canvas()
+    tint = BAD if data.get("urgent") else WARN
+    y = badge_header(c, glyph_calendar(data["month"], data["day"], tint), "DUE", tint)
+    y = big_with_unit(c, y, data["left"], "left", tint) + GAP_SECTION
+    f = font(FLOOR_SIZE, 700)
+    y = put(c, PAD, y, data["title"], f, INK) + line_gap(data["title"])
+    if data.get("course"):
+        y = put(c, PAD, y, data["course"], f, DIM) + GAP_SECTION
+    else:
+        y += GAP_SECTION - GAP_BAR
+    y = put(c, PAD, y, data.get("when") or "", f, DIM)
+    footer_clock(c, y + GAP_FOOTER, data["clock"])
     return c.flatten()
 
 
@@ -479,6 +824,11 @@ RENDERERS = {
     "claude_between_turns": claude_between_turns,
     "sessions": sessions,
     "idle": idle,
+    "now_playing": now_playing,
+    "print": print_progress,
+    "print_failed": print_failed,
+    "alert": alert,
+    "due_soon": due_soon,
 }
 
 
@@ -494,14 +844,21 @@ MOCK_ALIASES = {
     "worldengine-web": "we-web",
 }
 
-MOCK_SESSIONS_6 = [
-    ("waiting", "psi0-detector"),
-    ("waiting", "robot-g1"),
-    ("working", "worldengine-api"),
-    ("working", "worldengine-web"),
-    ("engaged", "psi0-planner"),
-    ("engaged", "keyboard-display"),
+MOCK_ROWS = [
+    {"state": "waiting", "name": "psi0-detector", "detail": ("Bash?", "0:41")},
+    {"state": "working", "name": "worldengine-api", "detail": ("4:32", "3/7")},
+    {"state": "working", "name": "worldengine-web", "detail": ("0:21", "")},
+    {"state": "done", "name": "psi0-planner", "detail": ("done", "2m")},
 ]
+
+MOCK_STRIPS = {
+    "print": {"kind": "print", "head": "1h12", "right": "63%", "frac": 0.63,
+              "tint": CLAY, "right_tint": CLAY},
+    "due": {"kind": "due", "head": "HW6", "sub": "CS570", "right": "2d",
+            "tint": DIM, "right_tint": INK},
+    "music": {"kind": "music", "head": "Blue in Green", "sub": "Bill Evans",
+              "tint": CLAY},
+}
 
 # Three different session ids, so the previews show three different slots of
 # the identifier palette rather than one colour repeated.
@@ -523,25 +880,39 @@ MOCKS = [
         "ident": MOCK_IDENTS["a3f92c"]}),
     ("claude_waiting", {
         "tool": "Bash?", "stuck": "2:41", "project": "psi0-detector",
-        "clock": "12:27", "ident": MOCK_IDENTS["7b14de"]}),
+        "clock": "12:27", "ident": MOCK_IDENTS["7b14de"], "strip": MOCK_STRIPS["due"]}),
     ("claude_between_turns", {
         "duration": "2m 14s", "project": "psi0-detector",
         "diff": ("+212", "−38"), "clock": "12:27",
-        "ident": MOCK_IDENTS["c081fa"]}),
-    ("sessions", {"entries": MOCK_SESSIONS_6, "clock": "12:27"}),
+        "ident": MOCK_IDENTS["c081fa"], "strip": MOCK_STRIPS["music"]}),
+    ("sessions", {"rows": MOCK_ROWS, "idle": 3, "clock": "12:27",
+                  "strip": MOCK_STRIPS["print"]}),
     ("sessions_overflow", {
-        "entries": MOCK_SESSIONS_6 + [("engaged", "infra-tools"),
-                                      ("engaged", "docs-site")],
-        "clock": "12:27"}),
+        "rows": MOCK_ROWS + [{"state": "working", "name": "infra-tools",
+                              "detail": ("7:02", "5/5")}],
+        "idle": 2, "clock": "12:27", "strip": None}),
     ("idle", {"hh": "12", "mm": "27", "weekday": "THU", "date": "AUG 27",
-              "meters": [("5H", 42), ("7D", 61)], "online": True}),
+              "meters": [("5H", 42), ("7D", 61)], "online": True,
+              "strip": MOCK_STRIPS["due"]}),
+    ("now_playing", {"title": "Blue in Green", "artist": "Bill Evans", "art": None,
+                     "frac": 0.41, "pos": "2:14", "rest": "−3:13",
+                     "source": "LSX II", "volume": "38", "clock": "12:27"}),
+    ("print", {"pct": 63, "left": "1h12", "file": "hook_v2", "filament": "PLA",
+               "filament_rgb": (226, 226, 220), "eta": "13:39", "clock": "12:27"}),
+    ("print_failed", {"pct": 41, "stuck": "4:12", "error": "喷嘴堵头",
+                      "file": "hook_v2", "clock": "12:27"}),
+    ("alert", {"since": "12:40", "what": "T7 SSD 未挂载", "detail": "/mnt/t7",
+               "clock": "12:27"}),
+    ("due_soon", {"month": "OCT", "day": "16", "left": "18h", "title": "HW6",
+                  "course": "CS570", "when": "Fri 23:59", "clock": "05:59"}),
 ]
+
+MOCK_KINDS = {"claude_working_no_todos": "claude_working",
+              "sessions_overflow": "sessions"}
 
 
 def render_mock(name):
     for mock_name, data in MOCKS:
         if mock_name == name:
-            kind = "sessions" if name.startswith("sessions") else \
-                   "claude_working" if name.startswith("claude_working") else name
-            return RENDERERS[kind](data, MOCK_ALIASES)
+            return RENDERERS[MOCK_KINDS.get(name, name)](data, MOCK_ALIASES)
     raise KeyError(name)
