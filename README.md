@@ -248,7 +248,7 @@ your config and the venv alone, exactly as the macOS `--uninstall` does.
 
 ### No global hotkeys, deliberately
 
-`Ctrl+Opt+Cmd+K` and `Ctrl+Opt+Cmd+J` do not exist on Linux and are not
+The `Ctrl+Opt+Cmd+H/J/K/L` hotkeys do not exist on Linux and are not
 planned. `keys.py` is built on Carbon's `RegisterEventHotKey` and
 `CGEventTap`; the Linux equivalents are an X11 grab, which is meaningless on a
 headless box and wrong under Wayland, or reading `/dev/input`, which is a
@@ -264,7 +264,8 @@ The panel is still fully drivable — the hotkey never did anything you cannot
 type:
 
 ```sh
-python3 ~/.claude/context-keyboard-display/display.py mode next       # the K key
+python3 ~/.claude/context-keyboard-display/display.py mode next       # the L key
+python3 ~/.claude/context-keyboard-display/display.py mode prev       # the H key
 python3 ~/.claude/context-keyboard-display/display.py mode sessions   # jump straight there
 ```
 
@@ -412,27 +413,31 @@ writes — and the display daemon picks the change up in about 0.3 s.
 `python3 keys.py --install` / `--uninstall` if you want it independent of the
 display daemon.
 
-Two keys, and they are deliberately not peers:
+Four keys, vim-shaped, all on `Ctrl+Opt+Cmd` — `H`/`L` move between screens,
+`J`/`K` move within the session list:
 
 | key | what it does |
 | --- | --- |
-| **`Ctrl+Opt+Cmd+K`** | one step round `auto -> claude -> sessions -> idle -> auto` — *except* while a session is drilled into, where the first press steps back out to the switchboard |
+| **`Ctrl+Opt+Cmd+L`** | one step forward round `auto -> claude -> sessions -> idle -> auto` — *except* while a session is drilled into, where the first press steps back out to the switchboard |
+| **`Ctrl+Opt+Cmd+H`** | the same, one step backward |
 | **`Ctrl+Opt+Cmd+J`** | drill into the switchboard: show the selected session's own detail screen, and step one row down the list per press, wrapping at the bottom. Does nothing on any other screen |
+| **`Ctrl+Opt+Cmd+K`** | the same, one row up, wrapping at the top. From the plain list it starts at the bottom row |
 
-So the panel has two levels, and `K` reads as "back / next" rather than as a
-fixed rotation:
+So the panel has two levels, and `H`/`L` read as "back out, then move" rather
+than as a fixed rotation:
 
 ```
 sessions (the switchboard)
-   │  J  drill in, then J again to walk the rows
+   │  J / K  drill in, then J / K again to walk the rows
    ▼
 claude_working / claude_waiting / claude_between_turns   for the chosen session
-   │  K  pop back out to the switchboard
+   │  H or L  pop back out to the switchboard
    ▼
-sessions  ──  K  ──▶  idle  ──  K  ──▶  auto  ──  K  ──▶  claude  ...
+sessions  ──  L  ──▶  idle  ──  L  ──▶  auto  ──  L  ──▶  claude  ...
+          ◀──  H  ──        ◀──  H  ──        ◀──  H  ──
 ```
 
-`J` is inert unless the switchboard is the screen actually on the panel. That
+`J` and `K` are inert unless the switchboard is the screen actually on the panel. That
 is a real precondition, not a formality: this panel has no input focus and no
 cursor, so a key that did something from any screen would be a key that does
 something you did not see. The listener finds out by reading
@@ -443,8 +448,8 @@ copy free to drift from the first.
 
 **The drill-down is a peek like any other.** Selecting a session does not get
 its own clock: it expires with the `override_ttl_seconds` (60 s) rebound
-described above, and lands back on `auto` — not on the switchboard. Every `J`
-and `K` press re-stamps the timer, so browsing keeps it alive and only walking
+described above, and lands back on `auto` — not on the switchboard. Every
+`H`/`J`/`K`/`L` press re-stamps the timer, so browsing keeps it alive and only walking
 away lets it lapse. A two-stage decay would leave the panel overriding reality
 for twice as long, and the first stage would end in a screen change nobody
 asked for.
@@ -456,7 +461,7 @@ If the pinned session ends while you are looking at it, the panel falls back
 to the switchboard rather than promoting some other session into a detail
 screen the heading says you chose.
 
-**Both defaults ask macOS for nothing.** There are two engines, and `--daemon`
+**The defaults ask macOS for nothing.** There are two engines, and `--daemon`
 picks between them by looking at the binding:
 
 | engine | used when | privacy grant |
@@ -478,17 +483,22 @@ Rebind in `~/.claude/context-keyboard-display.yaml`:
 
 ```yaml
 keys:
-  binding: "ctrl+opt+cmd+k"         # any combination of fn/ctrl/opt/shift/cmd + a key
+  binding: "ctrl+opt+cmd+l"         # any combination of fn/ctrl/opt/shift/cmd + a key
+  back_binding: "ctrl+opt+cmd+h"
   select_binding: "ctrl+opt+cmd+j"
+  up_binding: "ctrl+opt+cmd+k"
   swallow: auto                     # tap engine only — see below
 ```
 
-**Neither may be bound to a bare letter**, and `carbon_modifiers()` refuses to
+**None may be bound to a bare letter**, and `carbon_modifiers()` refuses to
 register one. A reserved combination never reaches the app you are typing
 into, so binding `j` alone would stop the letter j working everywhere on the
-machine — vim-style `hjkl` navigation is exactly the shape this cannot take.
-Only the cycle key falls back to the tap engine; if it does, the drill-down
-key is skipped with a line in the log.
+machine — which is why the `hjkl` keys carry `Ctrl+Opt+Cmd` rather than
+standing alone. Only the forward cycle key falls back to the tap engine; if it
+does, the other three are skipped with a line in the log. A config written
+before `H`/`L` existed still says `binding: "ctrl+opt+cmd+k"`; that key then
+stays on forward-cycle and the up key is skipped with a log line rather than
+failing the listener — change `binding` to `...+l` to get the new layout.
 
 `key_swallow` only means something to the tap: a reserved Carbon hotkey is
 always consumed, because reserving a combination is what stops it reaching
@@ -517,7 +527,8 @@ python3 keys.py --simulate       # tap engine: match/cycle/debounce/autorepeat l
 
 `--selftest` is what to trust before touching a real key. It registers the
 *real* hotkey with the *real* WindowServer, then posts a synthetic press
-into its own event queue once per mode and checks the cycle advanced,
+into its own event queue once per mode, forward with `L` and then back with
+`H`, and checks the cycle stepped each way,
 restoring whatever mode was active before it ran. A clean run proves the
 combination was accepted and that every step on this side of the line is
 right: the binding's translation into Carbon keycode + modifiers, the
@@ -547,7 +558,7 @@ frames off the wire, and can POST their own image to the panel. Fine on a home
 network; think twice on café Wi-Fi or a shared office VLAN.
 
 **The hotkeys need no privacy grant — unless you rebind them.** The defaults use
-Carbon's `RegisterEventHotKey`, which *reserves* those two combinations with the
+Carbon's `RegisterEventHotKey`, which *reserves* those four combinations with the
 WindowServer and can observe nothing else, so macOS grants them silently. A
 binding Carbon cannot express — `fn`, or a bare key with no modifier — falls back
 to a `CGEventTap`, which is handed every keystroke on the system and so needs

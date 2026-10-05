@@ -57,18 +57,23 @@ display:
     # worldengine-web: we-web
 
 keys:
-  # The global hotkeys (keys.py). Both must carry a real modifier: that is what
-  # lets macOS reserve them outright, with no Input Monitoring grant and no
-  # prompt. A bare letter would be registrable and catastrophic -- a reserved
-  # combination never reaches the app you are typing into, so binding "k" alone
-  # would stop the letter k working everywhere on the machine.
+  # The global hotkeys (keys.py), vim-shaped. All must carry a real modifier:
+  # that is what lets macOS reserve them outright, with no Input Monitoring
+  # grant and no prompt. A bare letter would be registrable and catastrophic --
+  # a reserved combination never reaches the app you are typing into, so
+  # binding "k" alone would stop the letter k working everywhere on the machine.
   #
-  # binding         steps the screen cycle below -- and, while a session is
-  #                 drilled into, first steps back out to the switchboard.
-  # select_binding  drills into the switchboard and steps down its rows. Does
-  #                 nothing at all unless the switchboard is the screen showing.
-  binding: "ctrl+opt+cmd+k"
+  # binding         (L) steps forward round the screen cycle below -- and,
+  #                 while a session is drilled into, first steps back out to
+  #                 the switchboard.
+  # back_binding    (H) the same, backward.
+  # select_binding  (J) drills into the switchboard and steps down its rows.
+  # up_binding      (K) the same, up. J and K do nothing at all unless the
+  #                 switchboard is the screen showing.
+  binding: "ctrl+opt+cmd+l"
+  back_binding: "ctrl+opt+cmd+h"
   select_binding: "ctrl+opt+cmd+j"
+  up_binding: "ctrl+opt+cmd+k"
   cycle: [auto, claude, sessions, idle]
   # auto: swallow only bindings that carry real modifiers (the tap engine's
   # concern; a reserved Carbon hotkey is always swallowed either way).

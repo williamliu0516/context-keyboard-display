@@ -18,9 +18,10 @@ here as a library.
     python3 display.py --health           is the tick loop alive? (container health)
     python3 display.py mode sessions      manual override (auto|claude|sessions|idle)
     python3 display.py mode next          advance the override one step round the cycle
+    python3 display.py mode prev          step it one place back instead
                                           (an override lapses back to auto after
                                           override_ttl_seconds, default 60)
-    python3 keys.py --permission          the hotkey that calls `mode next` for you
+    python3 keys.py --permission          the hotkeys that call `mode next|prev` for you
 
 macOS runs the daemon under launchd and installs the keys.py hotkey listener
 beside it; Ubuntu/Debian runs it under a systemd --user service and has no
@@ -106,10 +107,14 @@ DEFAULTS = {
     # display.aliases in the YAML lands here: {repo-basename: short-name}.
     "aliases": {},
     # keys.* in the YAML lands here (see keys.py: the global-hotkey listener).
-    "key_binding": "ctrl+opt+cmd+k",
-    # The drill-down key. Only ever acts while the switchboard is the screen on
-    # the panel, so it needs no cycle of its own -- see select_next_session.
+    # vim-shaped: L / H step forward / back round the screen cycle.
+    "key_binding": "ctrl+opt+cmd+l",
+    "key_back_binding": "ctrl+opt+cmd+h",
+    # The drill-down keys, J down and K up. Only ever act while the switchboard
+    # is the screen on the panel, so they need no cycle of their own -- see
+    # select_session.
     "key_select_binding": "ctrl+opt+cmd+j",
+    "key_up_binding": "ctrl+opt+cmd+k",
     "key_cycle": list(MODES),
     "key_swallow": "auto",
     "key_debounce_seconds": 0.35,
@@ -150,10 +155,9 @@ def load_config():
         # Parsed by hand rather than through the type-matched loop below:
         # `swallow` legitimately takes either the string "auto" or a bool, and
         # a mistyped binding must not silently fall back to the default.
-        if keys.get("binding") is not None:
-            config["key_binding"] = str(keys["binding"])
-        if keys.get("select_binding") is not None:
-            config["key_select_binding"] = str(keys["select_binding"])
+        for name in ("binding", "back_binding", "select_binding", "up_binding"):
+            if keys.get(name) is not None:
+                config["key_" + name] = str(keys[name])
         if isinstance(keys.get("cycle"), list) and keys["cycle"]:
             config["key_cycle"] = [str(m) for m in keys["cycle"]]
         if keys.get("swallow") is not None:
@@ -865,7 +869,7 @@ def set_mode(mode, sid=None, quiet=False):
     was, so each press restarts the same TTL rather than racing it.
     """
     if mode not in MODES:
-        sys.stderr.write("mode must be %s\n" % "|".join(MODES + ("next",)))
+        sys.stderr.write("mode must be %s\n" % "|".join(MODES + ("next", "prev")))
         return 2
     state = {"mode": mode, "set_at": time.time()}
     if sid and mode == "sessions":
@@ -894,33 +898,38 @@ def normalise_cycle(cycle):
     return tuple(seen) or MODES
 
 
-def cycle_mode(cycle=MODES, cfg=None):
-    """Advance the override one step and return the mode now in force.
+def cycle_mode(cycle=MODES, cfg=None, step=1):
+    """Step the override one place round the cycle and return the mode now in
+    force: forward for `step=1`, back for `step=-1`.
 
     A mode outside the cycle (the file was hand-edited, or the cycle was
-    shortened since) lands on the first entry rather than nowhere. The step is
-    taken from the *effective* mode, so an override that has already expired
-    advances from `auto` — pressing next after a peek lapsed starts the cycle
-    over rather than resuming where it left off.
+    shortened since) lands on the first entry going forward and the last going
+    back, rather than nowhere. The step is taken from the *effective* mode, so
+    an override that has already expired steps from `auto` — pressing next after
+    a peek lapsed starts the cycle over rather than resuming where it left off.
 
-    One exception, and it is what makes this key feel like one control rather
-    than two: while a session is drilled into, the first press *pops back to
-    the list* instead of advancing. Going straight from a session's detail to
-    `idle` would skip the screen the user came from and leave no way back
-    except all the way round the cycle.
+    One exception, and it is what makes these keys feel like one control rather
+    than two: while a session is drilled into, the first press in either
+    direction *pops back to the list* instead of stepping. Going straight from
+    a session's detail to `idle` or `claude` would skip the screen the user came
+    from and leave no way back except all the way round the cycle.
     """
     cycle = normalise_cycle(cycle)
     current, pinned = control_state(cfg)
     if current == "sessions" and pinned:
         set_mode("sessions", quiet=True)
         return "sessions"
-    nxt = cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
+    if current in cycle:
+        nxt = cycle[(cycle.index(current) + step) % len(cycle)]
+    else:
+        nxt = cycle[0] if step > 0 else cycle[-1]
     set_mode(nxt, quiet=True)
     return nxt
 
 
-def select_next_session(cfg=None):
-    """Drill into the switchboard, or step to the next session in it.
+def select_session(cfg=None, step=1):
+    """Drill into the switchboard, or step one session down (`step=1`) or up
+    (`step=-1`) in it.
 
     Returns the sid now pinned, or None if it did nothing. Doing nothing is the
     common case and the important one: this key is live only while the
@@ -928,8 +937,9 @@ def select_next_session(cfg=None):
     from any other screen is just a second way to be surprised by a panel you
     were not looking at.
 
-    "Next" follows the order the switchboard draws its rows in, not the order
-    sessions were collected in, so it steps down the list the user is reading.
+    The step follows the order the switchboard draws its rows in, not the
+    order sessions were collected in, so it moves through the list the user is
+    reading, wrapping at either end.
     The pin is a sid rather than a row index for the same reason: rows re-sort
     the moment a session changes state, and an index would then advance to
     whatever slid into that slot.
@@ -950,9 +960,13 @@ def select_next_session(cfg=None):
         return None
 
     index = next((i for i, s in enumerate(order) if s.sid == pinned), None)
-    # No pin, or a pin whose session has since ended: start at the top rather
-    # than guessing where in a changed list the user had got to.
-    nxt = order[0] if index is None else order[(index + 1) % len(order)]
+    # No pin, or a pin whose session has since ended: start from the end the
+    # key points away from -- down lands on the top row, up on the bottom one --
+    # rather than guessing where in a changed list the user had got to.
+    if index is None:
+        nxt = order[0] if step > 0 else order[-1]
+    else:
+        nxt = order[(index + step) % len(order)]
     set_mode("sessions", sid=nxt.sid, quiet=True)
     return nxt.sid
 
@@ -1193,10 +1207,11 @@ def main(argv):
         return code
     if command == "mode":
         target = args[1] if len(args) > 1 else ""
-        if target == "next":
-            # The same step the hotkey takes, over the same configured cycle,
-            # so `mode next` and a keypress can't disagree.
-            print("mode: %s" % cycle_mode(cfg["key_cycle"], cfg))
+        if target in ("next", "prev"):
+            # The same step the hotkeys take, over the same configured cycle,
+            # so `mode next|prev` and a keypress can't disagree.
+            step = 1 if target == "next" else -1
+            print("mode: %s" % cycle_mode(cfg["key_cycle"], cfg, step))
             return 0
         return set_mode(target)
     sys.stdout.write(USAGE)

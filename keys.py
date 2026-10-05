@@ -8,10 +8,12 @@ command here says so and does nothing -- `--install`/`--uninstall` succeed as
 no-ops, so a Linux install never fails on the hotkey it was never going to
 have, and everything else exits 3.
 
-One press of the bound key advances ~/.claude/context-keyboard-display-control.json
-through auto -> claude -> sessions -> idle -> auto; the display daemon reads
-that file on its next tick (<=5 s) and obeys it. No keyboard firmware macro is
-involved -- this is a small launchd agent of its own.
+Four keys, vim-shaped, all on ctrl+opt+cmd. L steps
+~/.claude/context-keyboard-display-control.json forward through
+auto -> claude -> sessions -> idle -> auto and H steps it back; J and K walk
+down and up the switchboard's rows, and do nothing on any other screen. The
+display daemon reads that file within ~0.3 s and obeys it. No keyboard firmware
+macro is involved -- this is a small launchd agent of its own.
 
 Two engines, picked automatically by --daemon:
 
@@ -196,50 +198,67 @@ class Cycler(object):
     def __init__(self, cfg):
         self.cfg = cfg
         self.binding = parse_binding(cfg["key_binding"])
+        self.back_binding = parse_binding(cfg["key_back_binding"])
         self.select_binding = parse_binding(cfg["key_select_binding"])
+        self.up_binding = parse_binding(cfg["key_up_binding"])
         self.cycle = display.normalise_cycle(cfg["key_cycle"])
         self.debounce = max(0.0, float(cfg["key_debounce_seconds"]))
         self.swallow = resolve_swallow(cfg["key_swallow"], self.binding)
-        self.last_fired = 0.0
-        self.last_selected = 0.0
+        # Per action, not shared: debounce is there to drop one key's double
+        # fire, and a quick j-then-k correction is two deliberate presses.
+        self.last = {}
         self.tap = None
 
     def hotkeys(self):
         """The bindings this listener wants, paired with what they do.
 
         Order is the registration order and therefore the hotkey id order; the
-        cycle key stays first so an engine that can only host one still hosts
-        the one the panel cannot be driven without.
+        forward cycle key stays first so an engine that can only host one still
+        hosts the one the panel cannot be driven without.
         """
         return ((self.binding, self.fire),
-                (self.select_binding, self.select))
+                (self.back_binding, self.back),
+                (self.select_binding, self.select),
+                (self.up_binding, self.select_up))
 
-    def fire(self, now=None):
-        """Advance the mode — or pop out of a drilled-into session, which
-        cycle_mode decides. Returns the new mode, or None if debounced."""
+    def _debounced(self, action, now):
         now = time.time() if now is None else now
-        if now - self.last_fired < self.debounce:
+        if now - self.last.get(action, 0.0) < self.debounce:
+            return True
+        self.last[action] = now
+        return False
+
+    def fire(self, now=None, step=1):
+        """Step the mode forward (or back, step=-1) — or pop out of a
+        drilled-into session, which cycle_mode decides. Returns the new mode,
+        or None if debounced."""
+        if self._debounced(("cycle", step), now):
             return None
-        self.last_fired = now
+        binding = self.binding if step > 0 else self.back_binding
         was, pinned = display.control_state(self.cfg)
-        mode = display.cycle_mode(self.cycle, self.cfg)
-        log("%s: mode %s%s -> %s" % (self.binding.label, was,
+        mode = display.cycle_mode(self.cycle, self.cfg, step)
+        log("%s: mode %s%s -> %s" % (binding.label, was,
                                      " [%s]" % pinned[:8] if pinned else "", mode))
         return mode
 
-    def select(self, now=None):
-        """Step to the next session on the switchboard. None if it did
-        nothing — debounced, or the switchboard is not the screen showing."""
-        now = time.time() if now is None else now
-        if now - self.last_selected < self.debounce:
+    def back(self, now=None):
+        return self.fire(now, step=-1)
+
+    def select(self, now=None, step=1):
+        """Step one session down (or up, step=-1) the switchboard. None if it
+        did nothing — debounced, or the switchboard is not the screen showing."""
+        if self._debounced(("select", step), now):
             return None
-        self.last_selected = now
-        sid = display.select_next_session(self.cfg)
+        binding = self.select_binding if step > 0 else self.up_binding
+        sid = display.select_session(self.cfg, step)
         if sid is None:
-            log("%s: not on the switchboard; ignored" % self.select_binding.label)
+            log("%s: not on the switchboard; ignored" % binding.label)
         else:
-            log("%s: session -> %s" % (self.select_binding.label, sid[:8]))
+            log("%s: session -> %s" % (binding.label, sid[:8]))
         return sid
+
+    def select_up(self, now=None):
+        return self.select(now, step=-1)
 
     def callback(self, proxy, event_type, event, refcon):
         """CGEventTap callback. Must never raise: an exception here would take
@@ -339,6 +358,14 @@ class HotKey(object):
                 if not self.slots:
                     raise ValueError("%s cannot be a Carbon hotkey" % binding.label)
                 log("skipping %s: no Carbon form (needs a real modifier)"
+                    % binding.label)
+                continue
+            # A config written before H/L existed still says binding: ...+k,
+            # which is now also the up key. Registering it twice would fail the
+            # whole listener; the earlier (more important) slot keeps it.
+            if any(b.keycode == binding.keycode and m == mods
+                   for b, m, _ in self.slots):
+                log("skipping %s: already bound to an earlier action"
                     % binding.label)
                 continue
             self.slots.append((binding, mods, action))
@@ -477,9 +504,10 @@ def run_hotkey(cfg):
     hotkey.background()
     hotkey.register()
     log("hotkeys registered (Carbon RegisterEventHotKey, no grant needed): "
-        "%s -> %s; %s -> next session on the switchboard"
-        % (cycler.binding.describe(), " -> ".join(cycler.cycle),
-           cycler.select_binding.label))
+        "%s / %s -> forward / back round %s; %s / %s -> down / up the switchboard"
+        % (cycler.binding.label, cycler.back_binding.label,
+           " -> ".join(cycler.cycle), cycler.select_binding.label,
+           cycler.up_binding.label))
     hotkey.run()
     return 0
 
@@ -518,20 +546,28 @@ def selftest(cfg):
     start = display.control_mode()
     result = {"ok": True, "seen": []}
 
+    back_slot = next((i for i, (b, _, _) in enumerate(hotkey.slots)
+                      if b is cycler.back_binding), None)
+    passes = [(0, result["seen"])]
+    if back_slot is not None:
+        result["back"] = []
+        passes.append((back_slot, result["back"]))
+
     def drive():
         try:
-            for _ in cycler.cycle:
-                cycler.last_fired = 0.0  # each synthetic press is a deliberate one
-                before = hotkey.fired
-                hotkey.press()
-                deadline = time.time() + 3.0
-                while hotkey.fired == before and time.time() < deadline:
-                    time.sleep(0.02)
-                if hotkey.fired == before:
-                    print("  FAIL: the event loop never delivered the press")
-                    result["ok"] = False
-                    break
-                result["seen"].append(display.control_mode())
+            for slot, seen in passes:
+                for _ in cycler.cycle:
+                    cycler.last.clear()  # each synthetic press is a deliberate one
+                    before = hotkey.fired
+                    hotkey.press(slot)
+                    deadline = time.time() + 3.0
+                    while hotkey.fired == before and time.time() < deadline:
+                        time.sleep(0.02)
+                    if hotkey.fired == before:
+                        print("  FAIL: the event loop never delivered the press")
+                        result["ok"] = False
+                        return
+                    seen.append(display.control_mode())
         finally:
             hotkey.stop()
 
@@ -561,6 +597,20 @@ def selftest(cfg):
     if len(seen) != len(cycler.cycle) or seen != expected:
         print("  FAIL: expected %s, got %s" % (expected, seen))
         result["ok"] = False
+
+    if "back" in result:
+        back = result["back"]
+        for index, mode in enumerate(back):
+            print("back %d -> mode %s" % (index + 1, mode))
+        # The forward pass went once round, so it ended where it started from.
+        here = cycler.cycle.index(expected[-1]) if expected else 0
+        want = [cycler.cycle[(here - 1 - i) % len(cycler.cycle)]
+                for i in range(len(cycler.cycle))]
+        if back != want:
+            print("  FAIL: expected %s, got %s" % (want, back))
+            result["ok"] = False
+    else:
+        print("back key not registered; back pass skipped")
 
     print("")
     if start != display.control_mode():
@@ -619,9 +669,12 @@ def show_permission(cfg, open_pane=True):
     carbon = carbon_modifiers(cycler.binding) is not None
     print("binding:  %s" % cycler.binding.describe())
     print("cycle:    %s" % " -> ".join(cycler.cycle + (cycler.cycle[0],)))
-    print("select:   %s%s" % (cycler.select_binding.label,
-                              "" if carbon_modifiers(cycler.select_binding) is not None
-                              else "  (NO Carbon form -- will not be registered)"))
+    for name, binding in (("back", cycler.back_binding),
+                          ("select", cycler.select_binding),
+                          ("up", cycler.up_binding)):
+        print("%-10s%s%s" % (name + ":", binding.label,
+                             "" if carbon_modifiers(binding) is not None
+                             else "  (NO Carbon form -- will not be registered)"))
     print("engine:   %s" % ("hotkey (Carbon RegisterEventHotKey)" if carbon
                             else "tap (CGEventTap, cycle key only)"))
     print("swallow:  %s" % ("yes, unconditionally: a reserved combination never"
@@ -762,7 +815,7 @@ def simulate(cfg, presses=None):
     print("starting mode: %s" % start)
     seen = []
     for index in range(count):
-        cycler.last_fired = 0.0  # each simulated press is a deliberate one
+        cycler.last.clear()  # each simulated press is a deliberate one
         result = cycler.callback(None, Quartz.kCGEventKeyDown, hit, None)
         mode = display.control_mode()
         seen.append(mode)
@@ -793,7 +846,7 @@ def simulate(cfg, presses=None):
         print("debounce: a second press within %.2fs was ignored (mode still %s)"
               % (cycler.debounce, before))
 
-    cycler.last_fired = 0.0
+    cycler.last.clear()
     if cycler.callback(None, Quartz.kCGEventKeyDown,
                        event_for(cycler.binding.keycode,
                                  cycler.binding.mods | noise, repeat=1),
@@ -805,7 +858,7 @@ def simulate(cfg, presses=None):
 
     # A near miss: same key, one extra modifier that the binding does not ask
     # for. Must not fire, and must reach the app.
-    cycler.last_fired = 0.0
+    cycler.last.clear()
     extra = MOD_CMD if not (cycler.binding.mods & MOD_CMD) else MOD_SHIFT
     miss = event_for(cycler.binding.keycode, cycler.binding.mods | noise | extra)
     if cycler.callback(None, Quartz.kCGEventKeyDown, miss, None) is None \
@@ -815,7 +868,7 @@ def simulate(cfg, presses=None):
     else:
         print("near miss: same key with an extra modifier ignored")
 
-    cycler.last_fired = 0.0
+    cycler.last.clear()
     other = 12 if cycler.binding.keycode != 12 else 13  # some unbound key
     if cycler.callback(None, Quartz.kCGEventKeyDown,
                        event_for(other, cycler.binding.mods | noise), None) is None \
@@ -896,6 +949,7 @@ UNSUPPORTED = (
     "need this listener. The same step the hotkey takes is one command:\n"
     "\n"
     "    python3 display.py mode next        # auto -> claude -> sessions -> idle\n"
+    "    python3 display.py mode prev        # one step back\n"
     "    python3 display.py mode sessions    # or jump straight to one\n"
     "\n"
     "Bind that to whatever your desktop, shell or keyboard firmware already\n"
