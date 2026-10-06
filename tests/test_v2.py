@@ -111,6 +111,14 @@ class Views(unittest.TestCase):
         v = home.alert_view(state(health=BAD), {"alert:t7": NOW - 60}, NOW)
         self.assertEqual((v["what"], v["since_s"]), ("T7 SSD 未挂载", 60))
 
+    def test_cover_paths(self):
+        h = home.Home({"home_url": "http://hb.test"})
+        self.assertEqual(h._art_path(("k17", "/api/music/k17art/0123456789abcdef.jpg")),
+                         "/api/music/k17art/0123456789abcdef.jpg")
+        self.assertEqual(h._art_path(("kef", "http://192.168.50.68/file/x")),
+                         "/api/music/kefart?u=http%3A%2F%2F192.168.50.68%2Ffile%2Fx")
+        self.assertEqual(h._art_path(("mac", 7)), "/api/music/artwork")
+
 
 class Strip(unittest.TestCase):
 

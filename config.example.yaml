@@ -51,8 +51,8 @@ diff_poll_seconds: 5.0
 # screens and the home screens: a print in progress or failed, the next course
 # deadline, what the speaker is playing, and health checks gone bad. Leave
 # home_url empty to turn all of it off; the panel then shows clocks there.
-# homeboard guards /api with a token: put it alone in a file only you can read
-# (chmod 600) and point home_token_file at it.
+# homeboard guards /api with a token: use its read-only KEYBOARD_TOKEN, put it
+# alone in a file only you can read (chmod 600) and point home_token_file at it.
 home_url: ""
 home_token_file: ""
 home_poll_seconds: 10.0

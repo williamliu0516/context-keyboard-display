@@ -2,7 +2,8 @@
 playing, and anything homeboard's health checks call bad.
 
 homeboard (the iPad home panel's backend) already gathers all of it; this
-module reads its `/api/state` snapshot and turns it into the small view
+module reads its `/api/keyboard` snapshot (the slice of `/api/state` this
+panel uses) and turns it into the small view
 models the strip and the home screens draw. Two layers, kept apart on purpose:
 
   views(state, now, cfg, ...)   pure: one snapshot in, the four views out.
@@ -370,6 +371,9 @@ class Home:
         if kind == "kef":
             return "/api/music/kefart?u=" + urllib.parse.quote(ref, safe="")
         if kind == "k17":
+            # homeboard publishes the K17 cover as its own proxy path already
+            if str(ref).startswith("/api/music/k17art/"):
+                return str(ref)
             return "/api/music/k17art/" + urllib.parse.quote(str(ref), safe="")
         return "/api/music/artwork"
 
@@ -383,10 +387,10 @@ class Home:
             return None
 
     def poll_once(self):
-        """One fetch of /api/state (and of the cover, when the track changed).
+        """One fetch of /api/keyboard (and of the cover, when the track changed).
         True on success. The thread calls this; so do --live and --status."""
         try:
-            data = json.loads(self._get("/api/state"))
+            data = json.loads(self._get("/api/keyboard"))
             state = data.get("state") if isinstance(data, dict) else None
             if not isinstance(state, dict):
                 raise ValueError("no state in the reply")

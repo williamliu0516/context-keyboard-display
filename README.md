@@ -422,7 +422,7 @@ in any terminal is noise on a panel this small.
 
 ## Home data (homeboard)
 
-The strip and the household screens read [homeboard]'s `GET /api/state` — the
+The strip and the household screens read [homeboard]'s `GET /api/keyboard` — the
 iPad panel's backend, which already watches the printer, the course board, the
 speakers and the health checks. `home.py` polls it every `home_poll_seconds`
 on a thread of its own; the render loop never waits on the network, and a
@@ -433,9 +433,12 @@ home_url: "http://PI-ADDRESS:8800"
 home_token_file: "~/.claude/context-keyboard-display.homeboard-token"   # chmod 600, the token alone
 ```
 
-homeboard guards `/api` with one shared token, sent here as a Bearer header.
-Over the plain-HTTP LAN URL it crosses the network in clear text, exactly as
-the iPad's own LAN login does.
+Use homeboard's read-only `KEYBOARD_TOKEN`, not the panel's own
+`HOMEBOARD_TOKEN`; it is sent here as a Bearer header. It opens only `GET` on
+`/api/keyboard` (the printer, deadline, health and now-playing fields this panel
+draws) and the cover proxies — no cookie, no WebSocket, no controls. Over the
+plain-HTTP LAN URL it crosses the network in clear text every poll, so it is
+built to be harmless when sniffed.
 
 What counts, and what deliberately does not:
 
