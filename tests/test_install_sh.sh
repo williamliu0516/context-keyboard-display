@@ -92,7 +92,7 @@ check   "accepts a Linux host at all"          "$linux_out" "DRY_RUN: platform L
 check   "picks the systemd --user service"     "$linux_out" "systemd --user service"
 check   "reports hotkeys as unavailable"       "$linux_out" "global hotkeys: no"
 check   "resolves the panel url"               "$linux_out" "http://192.168.1.50/image/upload"
-check   "downloads service.py too"             "$linux_out" "verified 9 files"
+check   "downloads service.py too"             "$linux_out" "verified 10 files"
 absent  "no macOS-only rejection"              "$linux_out" "this display drives a macOS"
 absent  "no launchd on the Linux path"         "$linux_out" "launchd"
 
@@ -103,7 +103,7 @@ darwin_out="$(dry Darwin)"
 check   "still installs a launchd agent"       "$darwin_out" "DRY_RUN: platform Darwin"
 check   "picks launchd"                        "$darwin_out" "launchd agent"
 check   "keeps the hotkey listener"            "$darwin_out" "global hotkeys: yes"
-check   "downloads the same file set"          "$darwin_out" "verified 9 files"
+check   "downloads the same file set"          "$darwin_out" "verified 10 files"
 
 # ------------------------------------------------------------ anything else
 

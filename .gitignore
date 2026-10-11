@@ -3,3 +3,5 @@ out/
 __pycache__/
 *.pyc
 .env
+# private notes for agents, never committed (see AGENTS.md)
+CLAUDE.local.md
